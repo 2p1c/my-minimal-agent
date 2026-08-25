@@ -1,0 +1,22 @@
+{
+  "name": "minimal-agent-ts",
+  "version": "0.1.0",
+  "description": "A minimalistic TypeScript LLM agent (tool-calling) — reproduction of minimal-agent",
+  "type": "module",
+  "scripts": {
+    "start": "tsx src/run_agent.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "dotenv": "^17.4.2",
+    "duck-duck-scrape": "^2.2.7",
+    "openai": "^7.5.0",
+    "turndown": "^7.2.4"
+  },
+  "devDependencies": {
+    "@types/node": "^26.3.0",
+    "@types/turndown": "^5.0.6",
+    "tsx": "^4.23.12",
+    "typescript": "^7.0.2"
+  }
+}
