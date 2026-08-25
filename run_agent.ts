@@ -2,7 +2,7 @@
 // 它会把 .env 文件里的变量读进 process.env（后续代码就能用 process.env.XXX 读取了）。
 import "dotenv/config";
 // 导入项目内部的模块（位于 src/ 目录）。注意必须带 `.js` 后缀（ESM + NodeNext 模块系统的要求）。
-import { Agent } from "./src/agent.js";
+import { mmagent } from "./src/agent.js";
 import {
   DuckDuckGoSearchTool,
   TavilySearchTool,
@@ -21,7 +21,7 @@ if (!model) {
 
 // 创建 Agent 实例，传入模型名和一个工具数组。
 // `new DuckDuckGoSearchTool(10)` 调用构造函数，参数 10 表示最多返回 10 条搜索结果。
-const agent = new Agent(model, [
+const agent = new mmagent(model, [
   // DuckDuckGo 不需要 API key，但可能被限流。如果限流，就换用下面那行的 Tavily 版本。
   new DuckDuckGoSearchTool(10),
   // new TavilySearchTool(10),

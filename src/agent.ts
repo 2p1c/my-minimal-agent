@@ -12,7 +12,7 @@ import type { Tool } from "./tools.js";
 type ChatMessage = OpenAI.ChatCompletionMessageParam;
 
 // 定义一个类。`export` 表示其他文件可以 import 使用它。
-export class Agent {
+export class mmagent {
   // 类的私有字段：`private` 表示只能在类内部访问，外部不能直接读取。
   // 冒号后面的部分是类型注解，例如 client 的类型是 OpenAI 客户端对象。
   private client: OpenAI;
