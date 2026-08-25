@@ -4,7 +4,7 @@
   "description": "A minimalistic TypeScript LLM agent (tool-calling) — reproduction of minimal-agent",
   "type": "module",
   "scripts": {
-    "start": "tsx src/run_agent.ts",
+    "start": "tsx run_agent.ts",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {

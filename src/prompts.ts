@@ -1,3 +1,6 @@
+// 导出系统提示词常量。`export` 表示其他文件可以 import 使用它。
+// 系统提示词的作用是告诉模型：它是谁、任务是什么、该遵守哪些规则。
+// 模板字符串（反引号包起来）可以跨行书写，并支持 `${...}` 插值（这里没用插值）。
 export const SYSTEM_PROMPT = `
 You are an expert assistant who can solve any task using tools. You will be given a task to solve as best you can.
 To do so, you have been given access to a list of tools. You should call these tools to gather information or take actions, then use their results to reach the final answer.
