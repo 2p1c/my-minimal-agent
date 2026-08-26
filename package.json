@@ -5,15 +5,19 @@
   "type": "module",
   "scripts": {
     "start": "tsx run_agent.ts",
+    "server": "tsx src/server.ts",
+    "build": "tsc",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
     "dotenv": "^17.4.2",
     "duck-duck-scrape": "^2.2.7",
+    "express": "^5.0.0",
     "openai": "^7.5.0",
     "turndown": "^7.2.4"
   },
   "devDependencies": {
+    "@types/express": "^5.0.0",
     "@types/node": "^26.3.0",
     "@types/turndown": "^5.0.6",
     "tsx": "^4.23.12",

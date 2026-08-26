@@ -59,13 +59,24 @@ export class mmagent {
   // 类型注解 `Promise<string>` 表示最终会给调用方一个字符串。
   // 方法内部可以用 `await` 暂停执行，直到某个异步操作完成。
   async run(task: string): Promise<string> {
-    // 消息数组：这是发送给模型的完整对话历史。
-    // `const` 声明常量（不能重新赋值）。类型注解 ChatMessage[] 表示“ChatMessage 的数组”。
-    const messages: ChatMessage[] = [
-      { role: "system", content: SYSTEM_PROMPT }, // system：设定模型的角色与行为规则
+    // CLI 入口：用单个 user 任务构造消息数组，交给 runLoop 跑循环。
+    return this.runLoop([
       { role: "user", content: task }, // user：用户提出的任务
-    ];
+    ]);
+  }
 
+  // HTTP 入口：接受外部传入的完整 messages 数组（含 user/assistant/tool/system 等）。
+  // 始终把 SYSTEM_PROMPT prepend 到最前，保证工具调用规则始终生效。
+  async runWithMessages(messages: ChatMessage[]): Promise<string> {
+    const fullMessages: ChatMessage[] = [
+      { role: "system", content: SYSTEM_PROMPT },
+      ...messages,
+    ];
+    return this.runLoop(fullMessages);
+  }
+
+  // 共享的 ReAct 循环：把消息数组发给模型，按工具调用结果决定下一步或返回最终文本。
+  private async runLoop(messages: ChatMessage[]): Promise<string> {
     // for 循环，最多执行 maxSteps 轮。
     for (let step = 0; step < this.maxSteps; step++) {
       // 调用 OpenAI 的聊天补全接口，拿到模型回复。
