@@ -3,9 +3,9 @@ import OpenAI from "openai";
 // 从 ./prompts.js 导入系统提示词（SYSTEM_PROMPT）。
 // 注意：在 ESM + NodeNext 模块系统下，导入本地文件必须写 `.js` 后缀（即使源码文件是 .ts）。
 import { SYSTEM_PROMPT } from "./prompts.js";
-// `import type` 表示只导入“类型”。这意味着 tools.ts 只在类型检查时被需要，
+// `import type` 表示只导入“类型”。这意味着 types.ts 只在类型检查时被需要，
 // 运行时不会生成任何对应代码。这里只需要 Tool 这个类型来标注工具的类型。
-import type { Tool } from "./tools.js";
+import type { Tool } from "./tools/types.js";
 
 // 给 OpenAI SDK 里的“聊天消息”类型起个别名，方便后面书写。
 // 它本质上是一个对象，例如 { role: "user", content: "..." } 或 { role: "assistant", tool_calls: [...] }。

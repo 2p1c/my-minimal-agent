@@ -5,11 +5,7 @@ import express from "express";
 import type { Request, Response } from "express";
 
 import { mmagent } from "./agent.js";
-import {
-  DuckDuckGoSearchTool,
-  TavilySearchTool,
-  VisitWebpageTool,
-} from "./tools.js";
+import { createTools } from "./tools/index.js";
 
 // 监听端口：可通过 PORT 环境变量覆盖，默认 8001（与 AGENT_INTEGRATION.md 对齐）。
 const PORT = Number(process.env.PORT) || 8001;
@@ -21,12 +17,8 @@ if (!model) {
   process.exit(1);
 }
 
-// 工具列表：和 CLI 入口保持一致。需要换 Tavily 时把 DuckDuckGo 那行注释掉、打开 Tavily 即可。
-const tools = [
-  new DuckDuckGoSearchTool(10),
-  // new TavilySearchTool(10),
-  new VisitWebpageTool(1000),
-];
+// 工具列表：统一通过 Tool Registry 获取，和 CLI 入口保持一致。
+const tools = createTools();
 
 // 全局共享一个 Agent 实例，底层 OpenAI client 也会复用 HTTP 连接。
 const agent = new mmagent(model, tools, undefined, process.env.OPENAI_BASE_URL);

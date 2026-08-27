@@ -3,11 +3,7 @@
 import "dotenv/config";
 // 导入项目内部的模块（位于 src/ 目录）。注意必须带 `.js` 后缀（ESM + NodeNext 模块系统的要求）。
 import { mmagent } from "./src/agent.js";
-import {
-  DuckDuckGoSearchTool,
-  TavilySearchTool,
-  VisitWebpageTool,
-} from "./src/tools.js";
+import { createTools } from "./src/tools/index.js";
 
 // 从环境变量读取模型名。process.env 是 Node 提供的对象，装着程序运行时的所有环境变量。
 const model = process.env.MODEL;
@@ -19,14 +15,8 @@ if (!model) {
   process.exit(1);
 }
 
-// 创建 Agent 实例，传入模型名和一个工具数组。
-// `new DuckDuckGoSearchTool(10)` 调用构造函数，参数 10 表示最多返回 10 条搜索结果。
-const agent = new mmagent(model, [
-  // DuckDuckGo 不需要 API key，但可能被限流。如果限流，就换用下面那行的 Tavily 版本。
-  new DuckDuckGoSearchTool(10),
-  // new TavilySearchTool(10),
-  new VisitWebpageTool(1000), // 网页内容转 markdown 后最多保留 1000 个字符
-]);
+// 创建 Agent 实例，传入模型名和工具数组。工具统一通过 Tool Registry 获取。
+const agent = new mmagent(model, createTools());
 
 // 顶层 await：因为 package.json 里 "type": "module"，模块顶层可以直接使用 await。
 // agent.run(...) 返回 Promise<string>，await 等它执行完并拿到最终答案字符串。
