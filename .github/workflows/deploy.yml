@@ -38,13 +38,13 @@ jobs:
           SSH_USER: ${{ secrets.DEPLOY_USER }}
           DEPLOY_PATH: ${{ secrets.DEPLOY_PATH }}
         run: |
-          install -m 600 /dev/null ~/deploy_key
-          echo "$SSH_KEY" > ~/deploy_key
-          ssh -i ~/deploy_key -o StrictHostKeyChecking=accept-new "$SSH_USER@$SSH_HOST" "
+          install -m 600 /dev/null ~/chat_yutongzhu_com
+          echo "$SSH_KEY" > ~/chat_yutongzhu_com
+          ssh -i ~/chat_yutongzhu_com -o StrictHostKeyChecking=accept-new "$SSH_USER@$SSH_HOST" "
             set -e
             cd '$DEPLOY_PATH'
             docker compose pull agent
             docker compose up -d --no-deps agent
             docker image prune -f
           "
-          rm -f ~/deploy_key
+          rm -f ~/chat_yutongzhu_com
