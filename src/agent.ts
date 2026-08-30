@@ -11,6 +11,32 @@ import type { Tool } from "./tools/types.js";
 // 它本质上是一个对象，例如 { role: "user", content: "..." } 或 { role: "assistant", tool_calls: [...] }。
 type ChatMessage = OpenAI.ChatCompletionMessageParam;
 
+// 每一轮 ReAct loop 对外可见的事件。观察者（日志 / SSE）用它看清模型有没有调工具。
+// 失败的观察者不能打断主循环，所以 emit 时会包一层 try。
+export type LoopEvent =
+  | {
+      type: "llm";
+      step: number;
+      contentPreview: string;
+      toolCalls: { id: string; name: string; arguments: string }[];
+    }
+  | {
+      type: "tool_result";
+      step: number;
+      toolCallId: string;
+      name: string;
+      resultPreview: string;
+    }
+  | { type: "final"; step: number; content: string }
+  | { type: "max_steps"; step: number; content: string };
+
+export type LoopListener = (event: LoopEvent) => void;
+
+function preview(text: string, max = 500): string {
+  if (!text) return "";
+  return text.length > max ? `${text.slice(0, max)}…` : text;
+}
+
 // 定义一个类。`export` 表示其他文件可以 import 使用它。
 export class mmagent {
   // 类的私有字段：`private` 表示只能在类内部访问，外部不能直接读取。
@@ -58,27 +84,47 @@ export class mmagent {
   // `async` 方法：返回一个 Promise（表示“将来会给出结果”的异步值）。
   // 类型注解 `Promise<string>` 表示最终会给调用方一个字符串。
   // 方法内部可以用 `await` 暂停执行，直到某个异步操作完成。
-  async run(task: string): Promise<string> {
+  async run(task: string, onEvent?: LoopListener): Promise<string> {
     // CLI 入口：用单个 user 任务构造消息数组，交给 runLoop 跑循环。
-    return this.runLoop([
-      { role: "user", content: task }, // user：用户提出的任务
-    ]);
+    return this.runLoop(
+      [
+        { role: "user", content: task }, // user：用户提出的任务
+      ],
+      onEvent,
+    );
   }
 
   // HTTP 入口：接受外部传入的完整 messages 数组（含 user/assistant/tool/system 等）。
   // 始终把 SYSTEM_PROMPT prepend 到最前，保证工具调用规则始终生效。
-  async runWithMessages(messages: ChatMessage[]): Promise<string> {
+  // onEvent 可选：每一步 loop 回调一次，供本地调试；不传则行为与原来完全一样。
+  async runWithMessages(
+    messages: ChatMessage[],
+    onEvent?: LoopListener,
+  ): Promise<string> {
     const fullMessages: ChatMessage[] = [
       { role: "system", content: SYSTEM_PROMPT },
       ...messages,
     ];
-    return this.runLoop(fullMessages);
+    return this.runLoop(fullMessages, onEvent);
   }
 
   // 共享的 ReAct 循环：把消息数组发给模型，按工具调用结果决定下一步或返回最终文本。
-  private async runLoop(messages: ChatMessage[]): Promise<string> {
-    // for 循环，最多执行 maxSteps 轮。
+  private async runLoop(
+    messages: ChatMessage[],
+    onEvent?: LoopListener,
+  ): Promise<string> {
+    const emit = (event: LoopEvent) => {
+      if (!onEvent) return;
+      try {
+        onEvent(event);
+      } catch {
+        // 观察者抛错不能让对话失败。
+      }
+    };
+
+    // for 循环，最多执行 maxSteps 轮。step 从 0 计；对外事件用 1-based 的序号。
     for (let step = 0; step < this.maxSteps; step++) {
+      const stepNum = step + 1;
       // 调用 OpenAI 的聊天补全接口，拿到模型回复。
       // `await` 会等待网络请求完成后才继续执行下一行。
       const response = await this.client.chat.completions.create({
@@ -94,6 +140,19 @@ export class mmagent {
       // 如果模型回复里带了工具调用请求，就执行这些工具。
       // `msg.tool_calls` 在模型没调用工具时是 undefined，所以先判断“存在且有内容”。
       if (msg.tool_calls && msg.tool_calls.length > 0) {
+        emit({
+          type: "llm",
+          step: stepNum,
+          contentPreview: preview(msg.content ?? ""),
+          toolCalls: msg.tool_calls
+            .filter((call) => call.type === "function")
+            .map((call) => ({
+              id: call.id,
+              name: call.function.name,
+              arguments: preview(call.function.arguments || ""),
+            })),
+        });
+
         // 把带 tool_calls 的 assistant 消息也加进历史，让模型在下一轮能看到自己调用过哪些工具。
         messages.push({
           role: "assistant",
@@ -110,10 +169,18 @@ export class mmagent {
           const tool = this.tools.get(call.function.name);
           if (!tool) {
             // 找不到工具时，把错误信息作为“工具结果”返回给模型，而不是让程序崩溃。
+            const unknown = `Unknown tool: ${call.function.name}`;
             messages.push({
               role: "tool",
               tool_call_id: call.id, // 用 id 把这条结果关联到模型那次的工具调用
-              content: `Unknown tool: ${call.function.name}`,
+              content: unknown,
+            });
+            emit({
+              type: "tool_result",
+              step: stepNum,
+              toolCallId: call.id,
+              name: call.function.name,
+              resultPreview: preview(unknown),
             });
             continue;
           }
@@ -141,15 +208,26 @@ export class mmagent {
           }
           // 把工具结果作为 role: "tool" 的消息加入历史，并关联到对应的 tool_call_id。
           messages.push({ role: "tool", tool_call_id: call.id, content: result });
+          emit({
+            type: "tool_result",
+            step: stepNum,
+            toolCallId: call.id,
+            name: call.function.name,
+            resultPreview: preview(result),
+          });
         }
       } else {
         // 模型没有调用工具，说明它已经给出最终答案，直接返回它的文本。
         // `??` 是空值合并运算符：若左边是 null/undefined，就使用右边的默认值。
-        return msg.content ?? "No answer produced.";
+        const content = msg.content ?? "No answer produced.";
+        emit({ type: "final", step: stepNum, content });
+        return content;
       }
     }
 
     // 循环次数耗尽仍没有得到答案（模型一直调用工具）。
-    return "Could not solve task: Maximum number of steps exceeded.";
+    const exhausted = "Could not solve task: Maximum number of steps exceeded.";
+    emit({ type: "max_steps", step: this.maxSteps, content: exhausted });
+    return exhausted;
   }
 }

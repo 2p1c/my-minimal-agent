@@ -20,9 +20,9 @@ const agent = new mmagent(model, createTools());
 
 // 顶层 await：因为 package.json 里 "type": "module"，模块顶层可以直接使用 await。
 // agent.run(...) 返回 Promise<string>，await 等它执行完并拿到最终答案字符串。
-const answer = await agent.run(
-  "What time is it now?",
-);
+const answer = await agent.run("What time is it now?", (evt) => {
+  console.log("[loop]", JSON.stringify(evt));
+});
 
 // 打印结果。
 console.log("--------------------");

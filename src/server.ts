@@ -5,7 +5,18 @@ import express from "express";
 import type { Request, Response } from "express";
 
 import { mmagent } from "./agent.js";
+import type { LoopEvent } from "./agent.js";
 import { createTools } from "./tools/index.js";
+
+// 生产镜像 Dockerfile 会设 NODE_ENV=production，默认既不打 loop 日志也不下发 SSE。
+// 本地 `npm run server` 不设 NODE_ENV，默认两层都开。显式 AGENT_LOOP_EVENTS=0 / AGENT_LOOP_LOG=0 可关掉。
+const isProd = process.env.NODE_ENV === "production";
+const LOOP_EVENTS =
+  process.env.AGENT_LOOP_EVENTS === "1" ||
+  (process.env.AGENT_LOOP_EVENTS !== "0" && !isProd);
+const LOOP_LOG =
+  process.env.AGENT_LOOP_LOG === "1" ||
+  (process.env.AGENT_LOOP_LOG !== "0" && !isProd);
 
 // 监听端口：可通过 PORT 环境变量覆盖，默认 8001（与 AGENT_INTEGRATION.md 对齐）。
 const PORT = Number(process.env.PORT) || 8001;
@@ -88,6 +99,7 @@ app.post("/complete/stream", async (req: Request, res: Response) => {
   res.setHeader("Content-Type", "text/event-stream");
   res.setHeader("Cache-Control", "no-cache");
   res.setHeader("Connection", "keep-alive");
+  res.setHeader("X-Accel-Buffering", "no");
   res.flushHeaders?.();
 
   const parsed = parseBody(req);
@@ -98,7 +110,15 @@ app.post("/complete/stream", async (req: Request, res: Response) => {
   }
 
   try {
-    const content = await agent.runWithMessages(parsed.messages as never);
+    const onEvent = (evt: LoopEvent) => {
+      if (LOOP_LOG) console.log("[loop]", JSON.stringify(evt));
+      if (LOOP_EVENTS) {
+        res.write(`event: loop\ndata: ${JSON.stringify(evt)}\n\n`);
+        const flushable = res as Response & { flush?: () => void };
+        flushable.flush?.();
+      }
+    };
+    const content = await agent.runWithMessages(parsed.messages as never, onEvent);
 
     // 按 Unicode 码点切块，避免 JS slice 把 emoji 的代理对拆开（Python utf-8 会炸）。
     const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
