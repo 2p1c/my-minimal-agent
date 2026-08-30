@@ -29,7 +29,7 @@ app.use(express.json({ limit: "1mb" }));
 
 // --- 工具函数 ---
 
-// SSE 流式渲染时每个 delta 事件包含的字符数。8 字符左右能给出"打字机"感，又不会让事件数爆炸。
+// SSE 流式渲染时每个 delta 的 Unicode 码点数。8 左右能给出打字机感，又不会让事件数爆炸。
 const DELTA_CHUNK_SIZE = 8;
 
 // 把 OpenAI SDK 抛的错（APIError 带 status 字段）映射到 AGENT_INTEGRATION.md 规定的 HTTP 状态码。
@@ -100,10 +100,11 @@ app.post("/complete/stream", async (req: Request, res: Response) => {
   try {
     const content = await agent.runWithMessages(parsed.messages as never);
 
-    // 把 final answer 按小 chunk 切成 delta 事件。每个 delta 发送前 await 25ms，制造打字机节奏。
+    // 按 Unicode 码点切块，避免 JS slice 把 emoji 的代理对拆开（Python utf-8 会炸）。
     const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
-    for (let i = 0; i < content.length; i += DELTA_CHUNK_SIZE) {
-      const chunk = content.slice(i, i + DELTA_CHUNK_SIZE);
+    const units = Array.from(content);
+    for (let i = 0; i < units.length; i += DELTA_CHUNK_SIZE) {
+      const chunk = units.slice(i, i + DELTA_CHUNK_SIZE).join("");
       await sleep(40);
       res.write(`data: ${JSON.stringify({ delta: chunk })}\n\n`);
     }
