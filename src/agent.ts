@@ -1,8 +1,7 @@
 // 导入 OpenAI SDK。它默认导出一个类，我们用 `new OpenAI({...})` 来创建客户端对象。
 import OpenAI from "openai";
-// 从 ./prompts.js 导入系统提示词（SYSTEM_PROMPT）。
-// 注意：在 ESM + NodeNext 模块系统下，导入本地文件必须写 `.js` 后缀（即使源码文件是 .ts）。
-import { SYSTEM_PROMPT } from "./prompts.js";
+// 从 ./prompts.js 导入协议提示词和默认人设。ESM + NodeNext 要求本地导入写 `.js` 后缀。
+import { IDENTITY, SYSTEM_PROMPT } from "./prompts.js";
 // `import type` 表示只导入“类型”。这意味着 types.ts 只在类型检查时被需要，
 // 运行时不会生成任何对应代码。这里只需要 Tool 这个类型来标注工具的类型。
 import type { Tool } from "./tools/types.js";
@@ -37,6 +36,36 @@ function preview(text: string, max = 500): string {
   return text.length > max ? `${text.slice(0, max)}…` : text;
 }
 
+// 调用方传入的 identity 视为不可信输入：去掉首尾空白并截断，避免把协议提示词挤出上下文。
+const IDENTITY_MAX_LENGTH = 4000;
+
+function normalizeIdentity(
+  identity: string | undefined,
+  fallback: string,
+): string | undefined {
+  const raw = identity === undefined ? fallback : identity;
+  const trimmed = raw.trim();
+  if (!trimmed) return undefined;
+  return trimmed.length > IDENTITY_MAX_LENGTH
+    ? trimmed.slice(0, IDENTITY_MAX_LENGTH)
+    : trimmed;
+}
+
+// 拼装顺序：协议 → 身份 → 对话。协议始终在最前，调用方不能替换。
+function assembleMessages(
+  messages: ChatMessage[],
+  identity: string | undefined,
+  fallbackIdentity: string,
+): ChatMessage[] {
+  const assembled: ChatMessage[] = [{ role: "system", content: SYSTEM_PROMPT }];
+  const id = normalizeIdentity(identity, fallbackIdentity);
+  if (id) {
+    assembled.push({ role: "system", content: id });
+  }
+  assembled.push(...messages);
+  return assembled;
+}
+
 // 定义一个类。`export` 表示其他文件可以 import 使用它。
 export class mmagent {
   // 类的私有字段：`private` 表示只能在类内部访问，外部不能直接读取。
@@ -57,6 +86,7 @@ export class mmagent {
     tools: Tool[] = [], // 工具列表，默认空数组。`Tool[]` 表示“Tool 的数组”。
     private maxSteps = 10, // 最多循环多少轮，防止模型无限调用工具导致死循环
     baseURL?: string, // 可选的 API 地址；`?` 表示该参数可以省略，省略时为 undefined（用 OpenAI 官方地址）
+    private identity = IDENTITY, // 默认人设；HTTP 可用请求体 identity 按次覆盖
   ) {
     // 创建 OpenAI 客户端。apiKey 从环境变量读取（顶层的 dotenv 已把 .env 加载进 process.env）。
     // baseURL 若未提供则为 undefined，SDK 会使用默认的 OpenAI 官方地址。
@@ -85,27 +115,29 @@ export class mmagent {
   // 类型注解 `Promise<string>` 表示最终会给调用方一个字符串。
   // 方法内部可以用 `await` 暂停执行，直到某个异步操作完成。
   async run(task: string, onEvent?: LoopListener): Promise<string> {
-    // CLI 入口：用单个 user 任务构造消息数组，交给 runLoop 跑循环。
+    // CLI 入口：用单个 user 任务构造消息数组，与 HTTP 共用拼装（协议 + 身份 + 对话）。
     return this.runLoop(
-      [
-        { role: "user", content: task }, // user：用户提出的任务
-      ],
+      assembleMessages(
+        [{ role: "user", content: task }],
+        undefined,
+        this.identity,
+      ),
       onEvent,
     );
   }
 
   // HTTP 入口：接受外部传入的完整 messages 数组（含 user/assistant/tool/system 等）。
-  // 始终把 SYSTEM_PROMPT prepend 到最前，保证工具调用规则始终生效。
+  // 始终把 SYSTEM_PROMPT prepend 到最前；identity 未传则用构造时的默认人设，传空字符串则不加身份层。
   // onEvent 可选：每一步 loop 回调一次，供本地调试；不传则行为与原来完全一样。
   async runWithMessages(
     messages: ChatMessage[],
     onEvent?: LoopListener,
+    identity?: string,
   ): Promise<string> {
-    const fullMessages: ChatMessage[] = [
-      { role: "system", content: SYSTEM_PROMPT },
-      ...messages,
-    ];
-    return this.runLoop(fullMessages, onEvent);
+    return this.runLoop(
+      assembleMessages(messages, identity, this.identity),
+      onEvent,
+    );
   }
 
   // 共享的 ReAct 循环：把消息数组发给模型，按工具调用结果决定下一步或返回最终文本。

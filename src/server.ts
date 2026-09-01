@@ -60,12 +60,18 @@ function classifyError(e: unknown): { status: number; body: { error: string; det
 }
 
 // 入参校验：messages 必须是数组。元素 shape 交给 OpenAI SDK 兜底校验。
-function parseBody(req: Request): { ok: true; messages: unknown[] } | { ok: false; detail: string } {
+function parseBody(
+  req: Request,
+): { ok: true; messages: unknown[]; identity?: string } | { ok: false; detail: string } {
   const body = req.body;
   if (!body || typeof body !== "object") return { ok: false, detail: "request body must be a JSON object" };
   const messages = (body as { messages?: unknown }).messages;
   if (!Array.isArray(messages)) return { ok: false, detail: "messages must be an array" };
-  return { ok: true, messages };
+  const identity = (body as { identity?: unknown }).identity;
+  if (identity !== undefined && typeof identity !== "string") {
+    return { ok: false, detail: "identity must be a string" };
+  }
+  return { ok: true, messages, identity };
 }
 
 // --- 路由 ---
@@ -83,8 +89,12 @@ app.post("/complete", async (req: Request, res: Response) => {
     return;
   }
   try {
-    // runWithMessages 会内部 prepend SYSTEM_PROMPT，所以这里直接传 Python 给的数组即可。
-    const content = await agent.runWithMessages(parsed.messages as never);
+    // runWithMessages 会内部 prepend 协议提示词和 identity，所以这里直接传 Python 给的数组即可。
+    const content = await agent.runWithMessages(
+      parsed.messages as never,
+      undefined,
+      parsed.identity,
+    );
     res.json({ role: "assistant", content });
   } catch (e) {
     const { status, body } = classifyError(e);
@@ -118,7 +128,11 @@ app.post("/complete/stream", async (req: Request, res: Response) => {
         flushable.flush?.();
       }
     };
-    const content = await agent.runWithMessages(parsed.messages as never, onEvent);
+    const content = await agent.runWithMessages(
+      parsed.messages as never,
+      onEvent,
+      parsed.identity,
+    );
 
     // 按 Unicode 码点切块，避免 JS slice 把 emoji 的代理对拆开（Python utf-8 会炸）。
     const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
