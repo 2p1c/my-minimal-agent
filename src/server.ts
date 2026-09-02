@@ -90,11 +90,19 @@ app.post("/complete", async (req: Request, res: Response) => {
   }
   try {
     // runWithMessages 会内部 prepend 协议提示词和 identity，所以这里直接传 Python 给的数组即可。
-    const content = await agent.runWithMessages(
+    const outcome = await agent.runWithMessages(
       parsed.messages as never,
       undefined,
       parsed.identity,
     );
+    if (outcome.type === "interrupt") {
+      res.status(500).json({
+        error: "internal",
+        detail: "browser interrupt not implemented in HTTP yet",
+      });
+      return;
+    }
+    const content = outcome.content;
     res.json({ role: "assistant", content });
   } catch (e) {
     const { status, body } = classifyError(e);
@@ -128,11 +136,22 @@ app.post("/complete/stream", async (req: Request, res: Response) => {
         flushable.flush?.();
       }
     };
-    const content = await agent.runWithMessages(
+    const outcome = await agent.runWithMessages(
       parsed.messages as never,
       onEvent,
       parsed.identity,
     );
+    if (outcome.type === "interrupt") {
+      res.write(
+        `event: error\ndata: ${JSON.stringify({
+          error: "internal",
+          detail: "browser interrupt not implemented in HTTP yet",
+        })}\n\n`,
+      );
+      res.end();
+      return;
+    }
+    const content = outcome.content;
 
     // 按 Unicode 码点切块，避免 JS slice 把 emoji 的代理对拆开（Python utf-8 会炸）。
     const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));

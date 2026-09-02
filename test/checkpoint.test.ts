@@ -3,21 +3,29 @@ import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { test } from "node:test";
-import { FileCheckpointStore } from "../src/checkpoint.js";
+import {
+  FileCheckpointStore,
+  type PendingCall,
+  type RunCheckpoint,
+} from "../src/checkpoint.js";
 
 const UUID = "11111111-1111-4111-8111-111111111111";
 
-function sample(over: Partial<{ updatedAt: string; pending: unknown[] }> = {}) {
+function sample(over: Partial<RunCheckpoint> = {}): RunCheckpoint {
   return {
     runId: UUID,
     messages: [{ role: "user" as const, content: "hi" }],
-    pending: over.pending ?? [
-      { toolCallId: "call_1", name: "run_browser_js", arguments: "{\"code\":\"x\"}" },
+    pending: [
+      {
+        toolCallId: "call_1",
+        name: "run_browser_js",
+        arguments: "{\"code\":\"x\"}",
+      } satisfies PendingCall,
     ],
     browserEvalFailures: 0,
     stepsUsed: 1,
     createdAt: "2026-01-01T00:00:00.000Z",
-    updatedAt: over.updatedAt ?? new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
     ...over,
   };
 }
