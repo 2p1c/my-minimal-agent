@@ -1,11 +1,27 @@
 // 导入 OpenAI SDK。它默认导出一个类，我们用 `new OpenAI({...})` 来创建客户端对象。
 import OpenAI from "openai";
+import { randomUUID } from "node:crypto";
 // 从 ./prompts.js 导入协议提示词和默认人设。ESM + NodeNext 要求本地导入写 `.js` 后缀。
 import { IDENTITY, SYSTEM_PROMPT } from "./prompts.js";
 // `import type` 表示只导入“类型”。这意味着 types.ts 只在类型检查时被需要，
 // 运行时不会生成任何对应代码。这里只需要 Tool 这个类型来标注工具的类型。
 import type { Tool } from "./tools/types.js";
-import { FileCheckpointStore, type CheckpointStore } from "./checkpoint.js";
+import {
+  FileCheckpointStore,
+  type CheckpointStore,
+  type PendingCall,
+} from "./checkpoint.js";
+
+export const BROWSER_EVAL_FAILURE_LIMIT = 3;
+export const BROWSER_EVAL_STOPPED_MESSAGE =
+  "已连续失败 3 次，停止改页面，向用户说明原因";
+
+type LoopContext = {
+  runId?: string;
+  browserEvalFailures: number;
+  stepsUsed: number;
+  createdAt?: string;
+};
 
 // 给 OpenAI SDK 里的“聊天消息”类型起个别名，方便后面书写。
 // 它本质上是一个对象，例如 { role: "user", content: "..." } 或 { role: "assistant", tool_calls: [...] }。
@@ -28,7 +44,8 @@ export type LoopEvent =
       resultPreview: string;
     }
   | { type: "final"; step: number; content: string }
-  | { type: "max_steps"; step: number; content: string };
+  | { type: "max_steps"; step: number; content: string }
+  | { type: "interrupt"; step: number; runId: string; pending: InterruptPending[] };
 
 export type LoopListener = (event: LoopEvent) => void;
 
@@ -38,6 +55,19 @@ export type InterruptPending = {
   summary: string;
   code: string;
 };
+
+function toInterruptPending(call: PendingCall): InterruptPending {
+  let summary = "";
+  let code = "";
+  try {
+    const args = JSON.parse(call.arguments || "{}") as Record<string, unknown>;
+    if (typeof args.summary === "string") summary = args.summary;
+    if (typeof args.code === "string") code = args.code;
+  } catch {
+    // 保留空 summary/code
+  }
+  return { tool_call_id: call.toolCallId, name: call.name, summary, code };
+}
 
 export type RunOutcome =
   | { type: "final"; content: string }
@@ -192,6 +222,7 @@ export class mmagent {
   private async runLoop(
     messages: ChatMessage[],
     onEvent?: LoopListener,
+    ctx: LoopContext = { browserEvalFailures: 0, stepsUsed: 0 },
   ): Promise<RunOutcome> {
     const emit = (event: LoopEvent) => {
       if (!onEvent) return;
@@ -202,8 +233,8 @@ export class mmagent {
       }
     };
 
-    // for 循环，最多执行 maxSteps 轮。step 从 0 计；对外事件用 1-based 的序号。
-    for (let step = 0; step < this.maxSteps; step++) {
+    // for 循环，最多执行 maxSteps 轮。可从 checkpoint 的 stepsUsed 续跑；对外事件用 1-based。
+    for (let step = ctx.stepsUsed; step < this.maxSteps; step++) {
       const stepNum = step + 1;
       // 调用 OpenAI 的聊天补全接口，拿到模型回复。
       // `await` 会等待网络请求完成后才继续执行下一行。
@@ -240,7 +271,9 @@ export class mmagent {
           tool_calls: msg.tool_calls,
         });
 
-        // for...of：遍历数组里的每一个工具调用。
+        const pending: PendingCall[] = [];
+
+        // for...of：遍历数组里的每一个工具调用。服务端先跑完，浏览器进 pending。
         for (const call of msg.tool_calls) {
           // 目前只支持 function 类型的调用，跳过其他类型（continue = 跳过本次循环）。
           if (call.type !== "function") continue;
@@ -275,7 +308,52 @@ export class mmagent {
             args = {};
           }
 
-          // 执行工具，并把返回的字符串结果存进 result。
+          if ((tool.execution ?? "server") === "browser") {
+            if (ctx.browserEvalFailures >= BROWSER_EVAL_FAILURE_LIMIT) {
+              messages.push({
+                role: "tool",
+                tool_call_id: call.id,
+                content: BROWSER_EVAL_STOPPED_MESSAGE,
+              });
+              emit({
+                type: "tool_result",
+                step: stepNum,
+                toolCallId: call.id,
+                name: call.function.name,
+                resultPreview: preview(BROWSER_EVAL_STOPPED_MESSAGE),
+              });
+              continue;
+            }
+
+            const code = args.code;
+            const emptyCode = typeof code !== "string" || code.trim() === "";
+            if (emptyCode) {
+              const emptyErr =
+                'Error: run_browser_js requires a non-empty "code" string.';
+              messages.push({
+                role: "tool",
+                tool_call_id: call.id,
+                content: emptyErr,
+              });
+              emit({
+                type: "tool_result",
+                step: stepNum,
+                toolCallId: call.id,
+                name: call.function.name,
+                resultPreview: preview(emptyErr),
+              });
+              continue;
+            }
+
+            pending.push({
+              toolCallId: call.id,
+              name: call.function.name,
+              arguments: call.function.arguments || "{}",
+            });
+            continue;
+          }
+
+          // 执行服务端工具，并把返回的字符串结果存进 result。
           let result: string;
           try {
             result = await tool.execute(args);
@@ -296,10 +374,35 @@ export class mmagent {
             resultPreview: preview(result),
           });
         }
+
+        if (pending.length > 0) {
+          const now = new Date().toISOString();
+          const runId = ctx.runId ?? randomUUID();
+          await this.checkpoints.save({
+            runId,
+            messages,
+            pending,
+            browserEvalFailures: ctx.browserEvalFailures,
+            stepsUsed: step + 1,
+            createdAt: ctx.createdAt ?? now,
+            updatedAt: now,
+          });
+          const interruptPending = pending.map(toInterruptPending);
+          emit({
+            type: "interrupt",
+            step: stepNum,
+            runId,
+            pending: interruptPending,
+          });
+          return { type: "interrupt", runId, pending: interruptPending };
+        }
       } else {
         // 模型没有调用工具，说明它已经给出最终答案，直接返回它的文本。
         // `??` 是空值合并运算符：若左边是 null/undefined，就使用右边的默认值。
         const content = msg.content ?? "No answer produced.";
+        if (ctx.runId) {
+          await this.checkpoints.delete(ctx.runId);
+        }
         emit({ type: "final", step: stepNum, content });
         return { type: "final", content };
       }
@@ -307,6 +410,9 @@ export class mmagent {
 
     // 循环次数耗尽仍没有得到答案（模型一直调用工具）。
     const exhausted = "Could not solve task: Maximum number of steps exceeded.";
+    if (ctx.runId) {
+      await this.checkpoints.delete(ctx.runId);
+    }
     emit({ type: "max_steps", step: this.maxSteps, content: exhausted });
     return { type: "max_steps", content: exhausted };
   }
