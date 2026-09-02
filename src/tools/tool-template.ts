@@ -11,8 +11,8 @@
  *   4. 运行 `npm run typecheck` 确认编译通过。
  *
  * 注意事项：
- *   - Tool 接口来自 ./types.js，只有 name / description / parameters / execute
- *     四个成员，不要新增或修改接口定义。
+ *   - Tool 接口来自 ./types.js，还可以可选设置 `execution: "browser"`；
+ *     默认或不写则为服务端执行。不要在模板类上真的加上 browser 字段。
  *   - execute 出错时返回错误字符串而不是抛异常，模型看到错误后能自行调整策略。
  *   - 如果输出可能很长（如网页、搜索结果），务必像 visit-webpage.ts 那样截断，
  *     避免一次性喂给模型过多内容。
