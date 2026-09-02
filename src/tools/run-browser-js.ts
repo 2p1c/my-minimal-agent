@@ -1,7 +1,7 @@
 import type { Tool } from "./types.js";
 
 export class RunBrowserJsTool implements Tool {
-  name = "run_browser_js";
+  name = "run_browser_code";
   execution = "browser" as const;
   description =
     "Modify the DOM of the current chat page by providing JavaScript for the page to eval. Changes vanish on refresh and are not stored on the server. Always include a human-readable summary of the visual change plus the executable JS. Do not use this for fetching URLs or searching the web.";
