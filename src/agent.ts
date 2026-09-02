@@ -132,6 +132,15 @@ function preview(text: string, max = 500): string {
   return text.length > max ? `${text.slice(0, max)}…` : text;
 }
 
+function emitLoop(onEvent: LoopListener | undefined, event: LoopEvent): void {
+  if (!onEvent) return;
+  try {
+    onEvent(event);
+  } catch {
+    // 观察者抛错不能让对话失败。
+  }
+}
+
 // 调用方传入的 identity 视为不可信输入：去掉首尾空白并截断，避免把协议提示词挤出上下文。
 const IDENTITY_MAX_LENGTH = 4000;
 
@@ -286,6 +295,13 @@ export class mmagent {
         messages.push({ role: "tool", tool_call_id: p.toolCallId, content: r.content });
         if (r.outcome === "ok") failures = 0;
         else if (r.outcome === "error") failures += 1;
+        emitLoop(onEvent, {
+          type: "tool_result",
+          step: checkpoint.stepsUsed,
+          toolCallId: p.toolCallId,
+          name: p.name,
+          resultPreview: preview(r.content),
+        });
       }
       return await this.runLoop(messages, onEvent, {
         runId,
@@ -304,14 +320,7 @@ export class mmagent {
     onEvent?: LoopListener,
     ctx: LoopContext = { browserEvalFailures: 0, stepsUsed: 0 },
   ): Promise<RunOutcome> {
-    const emit = (event: LoopEvent) => {
-      if (!onEvent) return;
-      try {
-        onEvent(event);
-      } catch {
-        // 观察者抛错不能让对话失败。
-      }
-    };
+    const emit = (event: LoopEvent) => emitLoop(onEvent, event);
 
     // for 循环，最多执行 maxSteps 轮。可从 checkpoint 的 stepsUsed 续跑；对外事件用 1-based。
     for (let step = ctx.stepsUsed; step < this.maxSteps; step++) {

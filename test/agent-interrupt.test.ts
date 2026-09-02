@@ -169,12 +169,18 @@ test("resume with ok continues to final and deletes checkpoint", async () => {
     const interrupted = await agent.runWithMessages([{ role: "user", content: "paint" }]);
     assert.equal(interrupted.type, "interrupt");
     if (interrupted.type !== "interrupt") return;
-    const outcome = await agent.resume(interrupted.runId, [
-      { tool_call_id: "call_js", content: "2", outcome: "ok" },
-    ]);
+    const events: { type: string; name?: string }[] = [];
+    const outcome = await agent.resume(
+      interrupted.runId,
+      [{ tool_call_id: "call_js", content: "2", outcome: "ok" }],
+      (evt) => events.push(evt),
+    );
     assert.equal(outcome.type, "final");
     if (outcome.type === "final") assert.equal(outcome.content, "done painting");
     assert.equal(await store.load(interrupted.runId), null);
+    assert.equal(events[0]?.type, "tool_result");
+    assert.equal(events[0]?.name, "run_browser_js");
+    assert.equal(events[events.length - 1]?.type, "final");
   } finally {
     await rm(dir, { recursive: true, force: true });
   }

@@ -215,6 +215,9 @@ test("POST /resume/stream returns SSE final without interrupt event", async () =
       assert.match(text, /streamed done/);
       assert.match(text, /\[DONE\]/);
       assert.doesNotMatch(text, /event: interrupt/);
+      assert.match(text, /event: loop/);
+      assert.match(text, /"type":"tool_result"/);
+      assert.match(text, /"type":"final"/);
     } finally {
       await close();
     }

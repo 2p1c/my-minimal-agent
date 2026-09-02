@@ -7,7 +7,7 @@ import express from "express";
 import type { Request, Response } from "express";
 
 import { mmagent, ResumeError } from "./agent.js";
-import type { LoopEvent, ResumeResult, RunOutcome } from "./agent.js";
+import type { LoopEvent, LoopListener, ResumeResult, RunOutcome } from "./agent.js";
 import { createTools } from "./tools/index.js";
 
 // 生产镜像 Dockerfile 会设 NODE_ENV=production，默认既不打 loop 日志也不下发 SSE。
@@ -104,6 +104,13 @@ function writeSse(res: Response, event: string | undefined, data: unknown): void
   flushable.flush?.();
 }
 
+function onLoopEvent(res: Response): LoopListener {
+  return (evt: LoopEvent) => {
+    if (LOOP_LOG) console.log("[loop]", JSON.stringify(evt));
+    if (LOOP_EVENTS) writeSse(res, "loop", evt);
+  };
+}
+
 async function sendStreamOutcome(res: Response, outcome: RunOutcome): Promise<void> {
   if (outcome.type === "interrupt") {
     writeSse(res, "interrupt", { run_id: outcome.runId, pending: outcome.pending });
@@ -175,15 +182,9 @@ export function createApp(agent: mmagent): express.Express {
     }
 
     try {
-      const onEvent = (evt: LoopEvent) => {
-        if (LOOP_LOG) console.log("[loop]", JSON.stringify(evt));
-        if (LOOP_EVENTS) {
-          writeSse(res, "loop", evt);
-        }
-      };
       const outcome = await agent.runWithMessages(
         parsed.messages as never,
-        onEvent,
+        onLoopEvent(res),
         parsed.identity,
       );
       await sendStreamOutcome(res, outcome);
@@ -224,7 +225,11 @@ export function createApp(agent: mmagent): express.Express {
     }
 
     try {
-      const outcome = await agent.resume(parsed.run_id, parsed.results);
+      const outcome = await agent.resume(
+        parsed.run_id,
+        parsed.results,
+        onLoopEvent(res),
+      );
       await sendStreamOutcome(res, outcome);
     } catch (e) {
       if (e instanceof ResumeError) {
