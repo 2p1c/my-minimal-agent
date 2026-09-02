@@ -218,3 +218,112 @@ test("resume with no pending throws conflict", async () => {
     await rm(dir, { recursive: true, force: true });
   }
 });
+
+test("three error outcomes then next browser call does not interrupt", async () => {
+  const { store, dir } = await tempStore();
+  try {
+    const js = browserArgs("x", "throw new Error('boom')");
+    const agent = makeAgent({
+      checkpoints: store,
+      maxSteps: 8,
+      turns: [
+        { tool_calls: [{ id: "c1", name: "run_browser_js", arguments: js }] },
+        { tool_calls: [{ id: "c2", name: "run_browser_js", arguments: js }] },
+        { tool_calls: [{ id: "c3", name: "run_browser_js", arguments: js }] },
+        { tool_calls: [{ id: "c4", name: "run_browser_js", arguments: js }] },
+        { content: "stopped after three failures" },
+      ],
+    });
+    const r1 = await agent.runWithMessages([{ role: "user", content: "paint" }]);
+    assert.equal(r1.type, "interrupt");
+    if (r1.type !== "interrupt") return;
+
+    const after = async (runId: string, id: string, n: number) => {
+      const o = await agent.resume(runId, [
+        { tool_call_id: id, content: `err${n}`, outcome: "error" },
+      ]);
+      return o;
+    };
+
+    const r2 = await after(r1.runId, "c1", 1);
+    assert.equal(r2.type, "interrupt");
+    if (r2.type !== "interrupt") return;
+    const r3 = await after(r2.runId, "c2", 2);
+    assert.equal(r3.type, "interrupt");
+    if (r3.type !== "interrupt") return;
+    const r4 = await after(r3.runId, "c3", 3);
+    assert.equal(r4.type, "final");
+    if (r4.type === "final") {
+      assert.equal(r4.content, "stopped after three failures");
+    }
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("ok outcome resets failure count so a later error can interrupt again", async () => {
+  const { store, dir } = await tempStore();
+  try {
+    const js = browserArgs("x", "1");
+    const agent = makeAgent({
+      checkpoints: store,
+      turns: [
+        { tool_calls: [{ id: "a", name: "run_browser_js", arguments: js }] },
+        { tool_calls: [{ id: "b", name: "run_browser_js", arguments: js }] },
+        { tool_calls: [{ id: "c", name: "run_browser_js", arguments: js }] },
+        { content: "after reset" },
+      ],
+    });
+    const i1 = await agent.runWithMessages([{ role: "user", content: "x" }]);
+    assert.equal(i1.type, "interrupt");
+    if (i1.type !== "interrupt") return;
+    const i2 = await agent.resume(i1.runId, [
+      { tool_call_id: "a", content: "boom", outcome: "error" },
+    ]);
+    assert.equal(i2.type, "interrupt");
+    if (i2.type !== "interrupt") return;
+    const i3 = await agent.resume(i2.runId, [
+      { tool_call_id: "b", content: "ok", outcome: "ok" },
+    ]);
+    assert.equal(i3.type, "interrupt");
+    if (i3.type !== "interrupt") return;
+    const cp = await store.load(i3.runId);
+    assert.equal(cp?.browserEvalFailures, 0);
+    const fin = await agent.resume(i3.runId, [
+      { tool_call_id: "c", content: "ok2", outcome: "ok" },
+    ]);
+    assert.equal(fin.type, "final");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("rejected outcome does not increment failures", async () => {
+  const { store, dir } = await tempStore();
+  try {
+    const js = browserArgs("x", "1");
+    const agent = makeAgent({
+      checkpoints: store,
+      turns: [
+        { tool_calls: [{ id: "a", name: "run_browser_js", arguments: js }] },
+        { tool_calls: [{ id: "b", name: "run_browser_js", arguments: js }] },
+        { content: "after reject" },
+      ],
+    });
+    const i1 = await agent.runWithMessages([{ role: "user", content: "x" }]);
+    assert.equal(i1.type, "interrupt");
+    if (i1.type !== "interrupt") return;
+    const i2 = await agent.resume(i1.runId, [
+      { tool_call_id: "a", content: "user rejected", outcome: "rejected" },
+    ]);
+    assert.equal(i2.type, "interrupt");
+    if (i2.type !== "interrupt") return;
+    assert.equal((await store.load(i2.runId))?.browserEvalFailures, 0);
+    const fin = await agent.resume(i2.runId, [
+      { tool_call_id: "b", content: "2", outcome: "ok" },
+    ]);
+    assert.equal(fin.type, "final");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
