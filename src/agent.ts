@@ -74,6 +74,34 @@ export type RunOutcome =
   | { type: "max_steps"; content: string }
   | { type: "interrupt"; runId: string; pending: InterruptPending[] };
 
+export type ResumeResult = {
+  tool_call_id: string;
+  content: string;
+  outcome: "ok" | "error" | "rejected";
+};
+
+export class ResumeError extends Error {
+  readonly status: number;
+  readonly error: "not_found" | "conflict" | "bad_request";
+  constructor(
+    kind: "not_found" | "no_pending" | "conflict" | "bad_results",
+    detail: string,
+  ) {
+    super(detail);
+    this.name = "ResumeError";
+    if (kind === "not_found") {
+      this.status = 404;
+      this.error = "not_found";
+    } else if (kind === "bad_results") {
+      this.status = 400;
+      this.error = "bad_request";
+    } else {
+      this.status = 409;
+      this.error = "conflict";
+    }
+  }
+}
+
 export type LlmClient = {
   chat: {
     completions: {
@@ -140,6 +168,7 @@ export class mmagent {
   // 冒号后面的部分是类型注解；client 可注入假 LLM，默认仍是 OpenAI 客户端。
   private client: LlmClient;
   private checkpoints: CheckpointStore;
+  private inflight = new Set<string>();
   // Map<K, V> 是键值对容器（类似字典）。这里以工具名称为键、工具对象为值，
   // 方便根据模型传来的工具名字快速查找到对应工具。
   // 泛型参数 <string, Tool> 表示“键的类型是 string，值的类型是 Tool”。
@@ -216,6 +245,57 @@ export class mmagent {
       assembleMessages(messages, identity, this.identity),
       onEvent,
     );
+  }
+
+  async resume(
+    runId: string,
+    results: ResumeResult[],
+    onEvent?: LoopListener,
+  ): Promise<RunOutcome> {
+    if (this.inflight.has(runId)) {
+      throw new ResumeError("conflict", `run ${runId} is already resuming`);
+    }
+    this.inflight.add(runId);
+    try {
+      const checkpoint = await this.checkpoints.load(runId);
+      if (!checkpoint) {
+        throw new ResumeError("not_found", `unknown run_id: ${runId}`);
+      }
+      if (checkpoint.pending.length === 0) {
+        throw new ResumeError("no_pending", `run ${runId} has no pending tool calls`);
+      }
+      const byId = new Map(results.map((r) => [r.tool_call_id, r]));
+      if (byId.size !== results.length) {
+        throw new ResumeError("bad_results", "duplicate tool_call_id in results");
+      }
+      for (const p of checkpoint.pending) {
+        if (!byId.has(p.toolCallId)) {
+          throw new ResumeError(
+            "bad_results",
+            `missing result for tool_call_id ${p.toolCallId}`,
+          );
+        }
+      }
+      if (results.length !== checkpoint.pending.length) {
+        throw new ResumeError("bad_results", "results must match pending tool calls exactly");
+      }
+      const messages = checkpoint.messages;
+      let failures = checkpoint.browserEvalFailures;
+      for (const p of checkpoint.pending) {
+        const r = byId.get(p.toolCallId)!;
+        messages.push({ role: "tool", tool_call_id: p.toolCallId, content: r.content });
+        if (r.outcome === "ok") failures = 0;
+        else if (r.outcome === "error") failures += 1;
+      }
+      return await this.runLoop(messages, onEvent, {
+        runId,
+        browserEvalFailures: failures,
+        stepsUsed: checkpoint.stepsUsed,
+        createdAt: checkpoint.createdAt,
+      });
+    } finally {
+      this.inflight.delete(runId);
+    }
   }
 
   // 共享的 ReAct 循环：把消息数组发给模型，按工具调用结果决定下一步或返回最终文本。
