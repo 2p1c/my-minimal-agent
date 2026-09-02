@@ -14,12 +14,15 @@ export type ScriptTurn =
       tool_calls: { id: string; name: string; arguments: string }[];
     };
 
-export function scriptedClient(turns: ScriptTurn[]): LlmClient {
+export function scriptedClient(turns: ScriptTurn[], delayMs = 0): LlmClient {
   let i = 0;
   return {
     chat: {
       completions: {
         async create() {
+          if (i > 0 && delayMs > 0) {
+            await new Promise((r) => setTimeout(r, delayMs));
+          }
           const turn = turns[i++];
           if (!turn) throw new Error("scripted LLM has no remaining turns");
           if ("tool_calls" in turn && turn.tool_calls) {
@@ -55,6 +58,7 @@ export function makeAgent(opts: {
   tools?: Tool[];
   maxSteps?: number;
   checkpoints?: CheckpointStore;
+  delayMs?: number;
 }): mmagent {
   return new mmagent(
     "test-model",
@@ -62,7 +66,10 @@ export function makeAgent(opts: {
     opts.maxSteps ?? 10,
     undefined,
     "",
-    { client: scriptedClient(opts.turns), checkpoints: opts.checkpoints },
+    {
+      client: scriptedClient(opts.turns, opts.delayMs ?? 0),
+      checkpoints: opts.checkpoints,
+    },
   );
 }
 

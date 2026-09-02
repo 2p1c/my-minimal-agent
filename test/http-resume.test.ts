@@ -262,3 +262,92 @@ test("checkpoint save failure yields 500 and no interrupt", async () => {
     await rm(dir, { recursive: true, force: true });
   }
 });
+
+test("concurrent resume: second request is 409", async () => {
+  const { store, dir } = await tempStore();
+  try {
+    const agent = makeAgent({
+      checkpoints: store,
+      delayMs: 250,
+      turns: [
+        {
+          tool_calls: [
+            { id: "call_js", name: "run_browser_js", arguments: browserArgs("x", "1") },
+          ],
+        },
+        { content: "slow final" },
+      ],
+    });
+    const { base, close } = await listen(agent);
+    try {
+      const started = await fetch(`${base}/complete`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ messages: [{ role: "user", content: "x" }] }),
+      });
+      const { run_id } = (await started.json()) as { run_id: string };
+      const body = JSON.stringify({
+        run_id,
+        results: [{ tool_call_id: "call_js", content: "1", outcome: "ok" }],
+      });
+      const [a, b] = await Promise.all([
+        fetch(`${base}/resume`, { method: "POST", headers: { "content-type": "application/json" }, body }),
+        fetch(`${base}/resume`, { method: "POST", headers: { "content-type": "application/json" }, body }),
+      ]);
+      const statuses = [a.status, b.status].sort();
+      assert.deepEqual(statuses, [200, 409]);
+      const win = a.status === 200 ? a : b;
+      assert.deepEqual(await win.json(), { role: "assistant", content: "slow final" });
+    } finally {
+      await close();
+    }
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("lock is released after resume so a second run_id 404 is not a stuck 409", async () => {
+  const { store, dir } = await tempStore();
+  try {
+    const agent = makeAgent({
+      checkpoints: store,
+      turns: [
+        {
+          tool_calls: [
+            { id: "call_js", name: "run_browser_js", arguments: browserArgs("x", "1") },
+          ],
+        },
+        { content: "done" },
+      ],
+    });
+    const { base, close } = await listen(agent);
+    try {
+      const started = await fetch(`${base}/complete`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ messages: [{ role: "user", content: "x" }] }),
+      });
+      const { run_id } = (await started.json()) as { run_id: string };
+      const payload = {
+        run_id,
+        results: [{ tool_call_id: "call_js", content: "1", outcome: "ok" }],
+      };
+      const first = await fetch(`${base}/resume`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+      assert.equal(first.status, 200);
+      const second = await fetch(`${base}/resume`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+      assert.equal(second.status, 404);
+    } finally {
+      await close();
+    }
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
