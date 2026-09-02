@@ -15,6 +15,8 @@ export interface Tool {
     // `string[]` 表示“字符串数组”类型。
     required?: readonly string[];
   };
+  /** 默认 "server"：在 Node 里 execute。browser 走 checkpoint 中断，不在服务端 eval。 */
+  execution?: "server" | "browser";
   // execute 是执行方法：接收一个参数对象，返回 Promise<string>（异步地返回一个字符串结果）。
   // 这里用箭头函数语法声明方法类型。
   execute: (args: Record<string, unknown>) => Promise<string>;

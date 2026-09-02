@@ -14,6 +14,7 @@
  * ────────────────────────────────────────────────────────────
  */
 import type { Tool } from "./types.js";
+import { RunBrowserJsTool } from "./run-browser-js.js";
 import { DuckDuckGoSearchTool } from "./web-search.js";
 import { VisitWebpageTool } from "./visit-webpage.js";
 
@@ -24,5 +25,6 @@ export function createTools(): Tool[] {
     new DuckDuckGoSearchTool(10),
     // new TavilySearchTool(10),
     new VisitWebpageTool(1000),
+    new RunBrowserJsTool(),
   ];
 }

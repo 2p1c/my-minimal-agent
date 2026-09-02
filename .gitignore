@@ -8,3 +8,4 @@ CLAUDE.md
 *.md
 .worktrees/
 .superpowers/
+runs/

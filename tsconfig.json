@@ -12,5 +12,5 @@
     "rootDir": ".",
     "types": ["node"]
   },
-  "include": ["src", "run_agent.ts"]
+  "include": ["src", "run_agent.ts", "test"]
 }

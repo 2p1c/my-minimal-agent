@@ -1,10 +1,27 @@
 // 导入 OpenAI SDK。它默认导出一个类，我们用 `new OpenAI({...})` 来创建客户端对象。
 import OpenAI from "openai";
+import { randomUUID } from "node:crypto";
 // 从 ./prompts.js 导入协议提示词和默认人设。ESM + NodeNext 要求本地导入写 `.js` 后缀。
 import { IDENTITY, SYSTEM_PROMPT } from "./prompts.js";
 // `import type` 表示只导入“类型”。这意味着 types.ts 只在类型检查时被需要，
 // 运行时不会生成任何对应代码。这里只需要 Tool 这个类型来标注工具的类型。
 import type { Tool } from "./tools/types.js";
+import {
+  FileCheckpointStore,
+  type CheckpointStore,
+  type PendingCall,
+} from "./checkpoint.js";
+
+export const BROWSER_EVAL_FAILURE_LIMIT = 3;
+export const BROWSER_EVAL_STOPPED_MESSAGE =
+  "已连续失败 3 次，停止改页面，向用户说明原因";
+
+type LoopContext = {
+  runId?: string;
+  browserEvalFailures: number;
+  stepsUsed: number;
+  createdAt?: string;
+};
 
 // 给 OpenAI SDK 里的“聊天消息”类型起个别名，方便后面书写。
 // 它本质上是一个对象，例如 { role: "user", content: "..." } 或 { role: "assistant", tool_calls: [...] }。
@@ -27,9 +44,88 @@ export type LoopEvent =
       resultPreview: string;
     }
   | { type: "final"; step: number; content: string }
-  | { type: "max_steps"; step: number; content: string };
+  | { type: "max_steps"; step: number; content: string }
+  | { type: "interrupt"; step: number; runId: string; pending: InterruptPending[] };
 
 export type LoopListener = (event: LoopEvent) => void;
+
+export type InterruptPending = {
+  tool_call_id: string;
+  name: string;
+  summary: string;
+  code: string;
+};
+
+function toInterruptPending(call: PendingCall): InterruptPending {
+  let summary = "";
+  let code = "";
+  try {
+    const args = JSON.parse(call.arguments || "{}") as Record<string, unknown>;
+    if (typeof args.summary === "string") summary = args.summary;
+    if (typeof args.code === "string") code = args.code;
+  } catch {
+    // 保留空 summary/code
+  }
+  return { tool_call_id: call.toolCallId, name: call.name, summary, code };
+}
+
+export type RunOutcome =
+  | { type: "final"; content: string }
+  | { type: "max_steps"; content: string }
+  | { type: "interrupt"; runId: string; pending: InterruptPending[] };
+
+export type ResumeResult = {
+  tool_call_id: string;
+  content: string;
+  outcome: "ok" | "error" | "rejected";
+};
+
+export class ResumeError extends Error {
+  readonly status: number;
+  readonly error: "not_found" | "conflict" | "bad_request";
+  constructor(
+    kind: "not_found" | "no_pending" | "conflict" | "bad_results",
+    detail: string,
+  ) {
+    super(detail);
+    this.name = "ResumeError";
+    if (kind === "not_found") {
+      this.status = 404;
+      this.error = "not_found";
+    } else if (kind === "bad_results") {
+      this.status = 400;
+      this.error = "bad_request";
+    } else {
+      this.status = 409;
+      this.error = "conflict";
+    }
+  }
+}
+
+export type LlmClient = {
+  chat: {
+    completions: {
+      create: (body: {
+        model: string;
+        messages: ChatMessage[];
+        tools?: OpenAI.ChatCompletionTool[];
+        tool_choice?: "auto";
+      }) => Promise<{
+        choices: Array<{
+          message: {
+            content?: string | null;
+            tool_calls?: OpenAI.ChatCompletionMessageToolCall[];
+          };
+        }>;
+      }>;
+    };
+  };
+};
+
+export type AgentDeps = {
+  client?: LlmClient;
+  checkpoints?: CheckpointStore;
+};
 
 function preview(text: string, max = 500): string {
   if (!text) return "";
@@ -69,8 +165,10 @@ function assembleMessages(
 // 定义一个类。`export` 表示其他文件可以 import 使用它。
 export class mmagent {
   // 类的私有字段：`private` 表示只能在类内部访问，外部不能直接读取。
-  // 冒号后面的部分是类型注解，例如 client 的类型是 OpenAI 客户端对象。
-  private client: OpenAI;
+  // 冒号后面的部分是类型注解；client 可注入假 LLM，默认仍是 OpenAI 客户端。
+  private client: LlmClient;
+  private checkpoints: CheckpointStore;
+  private inflight = new Set<string>();
   // Map<K, V> 是键值对容器（类似字典）。这里以工具名称为键、工具对象为值，
   // 方便根据模型传来的工具名字快速查找到对应工具。
   // 泛型参数 <string, Tool> 表示“键的类型是 string，值的类型是 Tool”。
@@ -87,13 +185,18 @@ export class mmagent {
     private maxSteps = 10, // 最多循环多少轮，防止模型无限调用工具导致死循环
     baseURL?: string, // 可选的 API 地址；`?` 表示该参数可以省略，省略时为 undefined（用 OpenAI 官方地址）
     private identity = IDENTITY, // 默认人设；HTTP 可用请求体 identity 按次覆盖
+    deps: AgentDeps = {},
   ) {
     // 创建 OpenAI 客户端。apiKey 从环境变量读取（顶层的 dotenv 已把 .env 加载进 process.env）。
     // baseURL 若未提供则为 undefined，SDK 会使用默认的 OpenAI 官方地址。
-    this.client = new OpenAI({
-      apiKey: process.env.OPENAI_API_KEY,
-      baseURL,
-    });
+    // 测试可注入 deps.client，避免真实网络调用。
+    this.client =
+      deps.client ??
+      new OpenAI({
+        apiKey: process.env.OPENAI_API_KEY,
+        baseURL,
+      });
+    this.checkpoints = deps.checkpoints ?? new FileCheckpointStore();
 
     // 把数组转成 Map 字典：
     //   tools.map((t) => [t.name, t])  -> 把每个工具变成 [工具名, 工具对象] 的二元数组
@@ -116,7 +219,7 @@ export class mmagent {
   // 方法内部可以用 `await` 暂停执行，直到某个异步操作完成。
   async run(task: string, onEvent?: LoopListener): Promise<string> {
     // CLI 入口：用单个 user 任务构造消息数组，与 HTTP 共用拼装（协议 + 身份 + 对话）。
-    return this.runLoop(
+    const outcome = await this.runLoop(
       assembleMessages(
         [{ role: "user", content: task }],
         undefined,
@@ -124,6 +227,10 @@ export class mmagent {
       ),
       onEvent,
     );
+    if (outcome.type === "interrupt") {
+      return `Interrupted: browser tool pending (run_id=${outcome.runId}). Resume via HTTP POST /resume.`;
+    }
+    return outcome.content;
   }
 
   // HTTP 入口：接受外部传入的完整 messages 数组（含 user/assistant/tool/system 等）。
@@ -133,18 +240,70 @@ export class mmagent {
     messages: ChatMessage[],
     onEvent?: LoopListener,
     identity?: string,
-  ): Promise<string> {
+  ): Promise<RunOutcome> {
     return this.runLoop(
       assembleMessages(messages, identity, this.identity),
       onEvent,
     );
   }
 
+  async resume(
+    runId: string,
+    results: ResumeResult[],
+    onEvent?: LoopListener,
+  ): Promise<RunOutcome> {
+    if (this.inflight.has(runId)) {
+      throw new ResumeError("conflict", `run ${runId} is already resuming`);
+    }
+    this.inflight.add(runId);
+    try {
+      const checkpoint = await this.checkpoints.load(runId);
+      if (!checkpoint) {
+        throw new ResumeError("not_found", `unknown run_id: ${runId}`);
+      }
+      if (checkpoint.pending.length === 0) {
+        throw new ResumeError("no_pending", `run ${runId} has no pending tool calls`);
+      }
+      const byId = new Map(results.map((r) => [r.tool_call_id, r]));
+      if (byId.size !== results.length) {
+        throw new ResumeError("bad_results", "duplicate tool_call_id in results");
+      }
+      for (const p of checkpoint.pending) {
+        if (!byId.has(p.toolCallId)) {
+          throw new ResumeError(
+            "bad_results",
+            `missing result for tool_call_id ${p.toolCallId}`,
+          );
+        }
+      }
+      if (results.length !== checkpoint.pending.length) {
+        throw new ResumeError("bad_results", "results must match pending tool calls exactly");
+      }
+      const messages = checkpoint.messages;
+      let failures = checkpoint.browserEvalFailures;
+      for (const p of checkpoint.pending) {
+        const r = byId.get(p.toolCallId)!;
+        messages.push({ role: "tool", tool_call_id: p.toolCallId, content: r.content });
+        if (r.outcome === "ok") failures = 0;
+        else if (r.outcome === "error") failures += 1;
+      }
+      return await this.runLoop(messages, onEvent, {
+        runId,
+        browserEvalFailures: failures,
+        stepsUsed: checkpoint.stepsUsed,
+        createdAt: checkpoint.createdAt,
+      });
+    } finally {
+      this.inflight.delete(runId);
+    }
+  }
+
   // 共享的 ReAct 循环：把消息数组发给模型，按工具调用结果决定下一步或返回最终文本。
   private async runLoop(
     messages: ChatMessage[],
     onEvent?: LoopListener,
-  ): Promise<string> {
+    ctx: LoopContext = { browserEvalFailures: 0, stepsUsed: 0 },
+  ): Promise<RunOutcome> {
     const emit = (event: LoopEvent) => {
       if (!onEvent) return;
       try {
@@ -154,8 +313,8 @@ export class mmagent {
       }
     };
 
-    // for 循环，最多执行 maxSteps 轮。step 从 0 计；对外事件用 1-based 的序号。
-    for (let step = 0; step < this.maxSteps; step++) {
+    // for 循环，最多执行 maxSteps 轮。可从 checkpoint 的 stepsUsed 续跑；对外事件用 1-based。
+    for (let step = ctx.stepsUsed; step < this.maxSteps; step++) {
       const stepNum = step + 1;
       // 调用 OpenAI 的聊天补全接口，拿到模型回复。
       // `await` 会等待网络请求完成后才继续执行下一行。
@@ -192,7 +351,9 @@ export class mmagent {
           tool_calls: msg.tool_calls,
         });
 
-        // for...of：遍历数组里的每一个工具调用。
+        const pending: PendingCall[] = [];
+
+        // for...of：遍历数组里的每一个工具调用。服务端先跑完，浏览器进 pending。
         for (const call of msg.tool_calls) {
           // 目前只支持 function 类型的调用，跳过其他类型（continue = 跳过本次循环）。
           if (call.type !== "function") continue;
@@ -227,7 +388,52 @@ export class mmagent {
             args = {};
           }
 
-          // 执行工具，并把返回的字符串结果存进 result。
+          if ((tool.execution ?? "server") === "browser") {
+            if (ctx.browserEvalFailures >= BROWSER_EVAL_FAILURE_LIMIT) {
+              messages.push({
+                role: "tool",
+                tool_call_id: call.id,
+                content: BROWSER_EVAL_STOPPED_MESSAGE,
+              });
+              emit({
+                type: "tool_result",
+                step: stepNum,
+                toolCallId: call.id,
+                name: call.function.name,
+                resultPreview: preview(BROWSER_EVAL_STOPPED_MESSAGE),
+              });
+              continue;
+            }
+
+            const code = args.code;
+            const emptyCode = typeof code !== "string" || code.trim() === "";
+            if (emptyCode) {
+              const emptyErr =
+                'Error: run_browser_js requires a non-empty "code" string.';
+              messages.push({
+                role: "tool",
+                tool_call_id: call.id,
+                content: emptyErr,
+              });
+              emit({
+                type: "tool_result",
+                step: stepNum,
+                toolCallId: call.id,
+                name: call.function.name,
+                resultPreview: preview(emptyErr),
+              });
+              continue;
+            }
+
+            pending.push({
+              toolCallId: call.id,
+              name: call.function.name,
+              arguments: call.function.arguments || "{}",
+            });
+            continue;
+          }
+
+          // 执行服务端工具，并把返回的字符串结果存进 result。
           let result: string;
           try {
             result = await tool.execute(args);
@@ -248,18 +454,46 @@ export class mmagent {
             resultPreview: preview(result),
           });
         }
+
+        if (pending.length > 0) {
+          const now = new Date().toISOString();
+          const runId = ctx.runId ?? randomUUID();
+          await this.checkpoints.save({
+            runId,
+            messages,
+            pending,
+            browserEvalFailures: ctx.browserEvalFailures,
+            stepsUsed: step + 1,
+            createdAt: ctx.createdAt ?? now,
+            updatedAt: now,
+          });
+          const interruptPending = pending.map(toInterruptPending);
+          emit({
+            type: "interrupt",
+            step: stepNum,
+            runId,
+            pending: interruptPending,
+          });
+          return { type: "interrupt", runId, pending: interruptPending };
+        }
       } else {
         // 模型没有调用工具，说明它已经给出最终答案，直接返回它的文本。
         // `??` 是空值合并运算符：若左边是 null/undefined，就使用右边的默认值。
         const content = msg.content ?? "No answer produced.";
+        if (ctx.runId) {
+          await this.checkpoints.delete(ctx.runId);
+        }
         emit({ type: "final", step: stepNum, content });
-        return content;
+        return { type: "final", content };
       }
     }
 
     // 循环次数耗尽仍没有得到答案（模型一直调用工具）。
     const exhausted = "Could not solve task: Maximum number of steps exceeded.";
+    if (ctx.runId) {
+      await this.checkpoints.delete(ctx.runId);
+    }
     emit({ type: "max_steps", step: this.maxSteps, content: exhausted });
-    return exhausted;
+    return { type: "max_steps", content: exhausted };
   }
 }
