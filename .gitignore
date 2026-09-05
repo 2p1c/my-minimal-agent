@@ -9,3 +9,5 @@ CLAUDE.md
 .worktrees/
 .superpowers/
 runs/
+.DS_Store
+.cursor/
