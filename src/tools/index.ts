@@ -17,14 +17,18 @@ import type { Tool } from "./types.js";
 import { RunBrowserJsTool } from "./run-browser-js.js";
 import { DuckDuckGoSearchTool } from "./web-search.js";
 import { VisitWebpageTool } from "./visit-webpage.js";
+import { RagSearchTool } from "./rag-search.js";
 
 // 需要换 Tavily 时把 DuckDuckGo 那行注释掉、打开 Tavily 即可（需设置 TAVILY_API_KEY）。
 export function createTools(): Tool[] {
-  return [
+  const tools: Tool[] = [
     // ↓↓↓ 在这里注册新工具：new YourTool(...)，一行一个 ↓↓↓
     new DuckDuckGoSearchTool(10),
     // new TavilySearchTool(10),
     new VisitWebpageTool(1000),
     new RunBrowserJsTool(),
   ];
+  const ragUrl = process.env.RAG_SEARCH_URL?.trim();
+  if (ragUrl) tools.push(new RagSearchTool(ragUrl));
+  return tools;
 }

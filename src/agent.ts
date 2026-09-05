@@ -6,6 +6,7 @@ import { IDENTITY, SYSTEM_PROMPT } from "./prompts.js";
 // `import type` 表示只导入“类型”。这意味着 types.ts 只在类型检查时被需要，
 // 运行时不会生成任何对应代码。这里只需要 Tool 这个类型来标注工具的类型。
 import type { Tool } from "./tools/types.js";
+import { applyRagSlash } from "./tools/rag-search.js";
 import {
   FileCheckpointStore,
   type CheckpointStore,
@@ -228,12 +229,12 @@ export class mmagent {
   // 方法内部可以用 `await` 暂停执行，直到某个异步操作完成。
   async run(task: string, onEvent?: LoopListener): Promise<string> {
     // CLI 入口：用单个 user 任务构造消息数组，与 HTTP 共用拼装（协议 + 身份 + 对话）。
+    const prepared = await applyRagSlash(
+      [{ role: "user", content: task }],
+      this.tools.get("rag_search"),
+    );
     const outcome = await this.runLoop(
-      assembleMessages(
-        [{ role: "user", content: task }],
-        undefined,
-        this.identity,
-      ),
+      assembleMessages(prepared, undefined, this.identity),
       onEvent,
     );
     if (outcome.type === "interrupt") {
@@ -250,8 +251,12 @@ export class mmagent {
     onEvent?: LoopListener,
     identity?: string,
   ): Promise<RunOutcome> {
+    const prepared = await applyRagSlash(
+      messages,
+      this.tools.get("rag_search"),
+    );
     return this.runLoop(
-      assembleMessages(messages, identity, this.identity),
+      assembleMessages(prepared, identity, this.identity),
       onEvent,
     );
   }
