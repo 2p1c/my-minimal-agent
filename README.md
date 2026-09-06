@@ -1,7 +1,7 @@
 <h1 align="center">mmagent</h1>
 
 <p align="center">
-  <img src="assets/cover.png" alt="mmagent：HTTP → ReAct 循环 → 服务端工具 / 浏览器 checkpoint">
+  <img src="assets/cover.png" alt="mmagent：HTTP → ReAct 循环 → 服务端工具 / 浏览器 checkpoint" width="80%">
 </p>
 
 <p align="center">
