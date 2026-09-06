@@ -73,7 +73,8 @@ function toInterruptPending(call: PendingCall): InterruptPending {
 export type RunOutcome =
   | { type: "final"; content: string }
   | { type: "max_steps"; content: string }
-  | { type: "interrupt"; runId: string; pending: InterruptPending[] };
+  | { type: "interrupt"; runId: string; pending: InterruptPending[] }
+  | { type: "cancelled" };
 
 export type ResumeResult = {
   tool_call_id: string;
@@ -106,12 +107,15 @@ export class ResumeError extends Error {
 export type LlmClient = {
   chat: {
     completions: {
-      create: (body: {
-        model: string;
-        messages: ChatMessage[];
-        tools?: OpenAI.ChatCompletionTool[];
-        tool_choice?: "auto";
-      }) => Promise<{
+      create: (
+        body: {
+          model: string;
+          messages: ChatMessage[];
+          tools?: OpenAI.ChatCompletionTool[];
+          tool_choice?: "auto";
+        },
+        options?: { signal?: AbortSignal },
+      ) => Promise<{
         choices: Array<{
           message: {
             content?: string | null;
@@ -122,6 +126,10 @@ export type LlmClient = {
     };
   };
 };
+
+function isAbortError(e: unknown): boolean {
+  return !!e && typeof e === "object" && (e as { name?: string }).name === "AbortError";
+}
 
 export type AgentDeps = {
   client?: LlmClient;
@@ -227,7 +235,7 @@ export class mmagent {
   // `async` 方法：返回一个 Promise（表示“将来会给出结果”的异步值）。
   // 类型注解 `Promise<string>` 表示最终会给调用方一个字符串。
   // 方法内部可以用 `await` 暂停执行，直到某个异步操作完成。
-  async run(task: string, onEvent?: LoopListener): Promise<string> {
+  async run(task: string, onEvent?: LoopListener, signal?: AbortSignal): Promise<string> {
     // CLI 入口：用单个 user 任务构造消息数组，与 HTTP 共用拼装（协议 + 身份 + 对话）。
     const prepared = await applyRagSlash(
       [{ role: "user", content: task }],
@@ -236,10 +244,13 @@ export class mmagent {
     const outcome = await this.runLoop(
       assembleMessages(prepared, undefined, this.identity),
       onEvent,
+      undefined,
+      signal,
     );
     if (outcome.type === "interrupt") {
       return `Interrupted: browser tool pending (run_id=${outcome.runId}). Resume via HTTP POST /resume.`;
     }
+    if (outcome.type === "cancelled") return "Cancelled.";
     return outcome.content;
   }
 
@@ -250,6 +261,7 @@ export class mmagent {
     messages: ChatMessage[],
     onEvent?: LoopListener,
     identity?: string,
+    signal?: AbortSignal,
   ): Promise<RunOutcome> {
     const prepared = await applyRagSlash(
       messages,
@@ -258,6 +270,8 @@ export class mmagent {
     return this.runLoop(
       assembleMessages(prepared, identity, this.identity),
       onEvent,
+      undefined,
+      signal,
     );
   }
 
@@ -265,6 +279,7 @@ export class mmagent {
     runId: string,
     results: ResumeResult[],
     onEvent?: LoopListener,
+    signal?: AbortSignal,
   ): Promise<RunOutcome> {
     if (this.inflight.has(runId)) {
       throw new ResumeError("conflict", `run ${runId} is already resuming`);
@@ -278,6 +293,7 @@ export class mmagent {
       if (checkpoint.pending.length === 0) {
         throw new ResumeError("no_pending", `run ${runId} has no pending tool calls`);
       }
+      if (signal?.aborted) return this.cancelled(runId);
       const byId = new Map(results.map((r) => [r.tool_call_id, r]));
       if (byId.size !== results.length) {
         throw new ResumeError("bad_results", "duplicate tool_call_id in results");
@@ -308,15 +324,25 @@ export class mmagent {
           resultPreview: preview(r.content),
         });
       }
-      return await this.runLoop(messages, onEvent, {
-        runId,
-        browserEvalFailures: failures,
-        stepsUsed: checkpoint.stepsUsed,
-        createdAt: checkpoint.createdAt,
-      });
+      return await this.runLoop(
+        messages,
+        onEvent,
+        {
+          runId,
+          browserEvalFailures: failures,
+          stepsUsed: checkpoint.stepsUsed,
+          createdAt: checkpoint.createdAt,
+        },
+        signal,
+      );
     } finally {
       this.inflight.delete(runId);
     }
+  }
+
+  private async cancelled(runId?: string): Promise<RunOutcome> {
+    if (runId) await this.checkpoints.delete(runId);
+    return { type: "cancelled" };
   }
 
   // 共享的 ReAct 循环：把消息数组发给模型，按工具调用结果决定下一步或返回最终文本。
@@ -324,20 +350,31 @@ export class mmagent {
     messages: ChatMessage[],
     onEvent?: LoopListener,
     ctx: LoopContext = { browserEvalFailures: 0, stepsUsed: 0 },
+    signal?: AbortSignal,
   ): Promise<RunOutcome> {
     const emit = (event: LoopEvent) => emitLoop(onEvent, event);
 
     // for 循环，最多执行 maxSteps 轮。可从 checkpoint 的 stepsUsed 续跑；对外事件用 1-based。
     for (let step = ctx.stepsUsed; step < this.maxSteps; step++) {
+      if (signal?.aborted) return this.cancelled(ctx.runId);
       const stepNum = step + 1;
       // 调用 OpenAI 的聊天补全接口，拿到模型回复。
       // `await` 会等待网络请求完成后才继续执行下一行。
-      const response = await this.client.chat.completions.create({
-        model: this.model,
-        messages, // 整个对话历史
-        tools: this.toolSchemas, // 告诉模型它有哪些工具可用
-        tool_choice: "auto", // 允许模型自主决定是否调用工具
-      });
+      let response: Awaited<ReturnType<LlmClient["chat"]["completions"]["create"]>>;
+      try {
+        response = await this.client.chat.completions.create(
+          {
+            model: this.model,
+            messages, // 整个对话历史
+            tools: this.toolSchemas, // 告诉模型它有哪些工具可用
+            tool_choice: "auto", // 允许模型自主决定是否调用工具
+          },
+          { signal },
+        );
+      } catch (e) {
+        if (signal?.aborted || isAbortError(e)) return this.cancelled(ctx.runId);
+        throw e;
+      }
 
       // 取第一条回复（choices 是候选回复列表，通常只用第一个）。
       const msg = response.choices[0].message;
@@ -481,6 +518,7 @@ export class mmagent {
             createdAt: ctx.createdAt ?? now,
             updatedAt: now,
           });
+          if (signal?.aborted) return this.cancelled(runId);
           const interruptPending = pending.map(toInterruptPending);
           emit({
             type: "interrupt",

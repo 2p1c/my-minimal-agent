@@ -2,9 +2,9 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { RunBrowserJsTool } from "../src/tools/run-browser-js.js";
 
-test("run_browser_js is marked browser and execute does not run code", async () => {
+test("run_browser_code is marked browser and execute does not run code", async () => {
   const tool = new RunBrowserJsTool();
-  assert.equal(tool.name, "run_browser_js");
+  assert.equal(tool.name, "run_browser_code");
   assert.equal(tool.execution, "browser");
   assert.deepEqual(tool.parameters.required, ["summary", "code"]);
 

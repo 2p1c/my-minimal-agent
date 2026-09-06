@@ -28,7 +28,7 @@ test("POST /complete returns interrupt JSON and does not execute browser JS", as
           tool_calls: [
             {
               id: "call_js",
-              name: "run_browser_js",
+              name: "run_browser_code",
               arguments: browserArgs("red", "document.body.style.background='red'"),
             },
           ],
@@ -71,7 +71,7 @@ test("POST /complete/stream emits event interrupt then ends without done", async
           tool_calls: [
             {
               id: "call_js",
-              name: "run_browser_js",
+              name: "run_browser_code",
               arguments: browserArgs("x", "1"),
             },
           ],
@@ -148,7 +148,7 @@ test("POST /resume with ok returns final assistant and deletes snapshot", async 
       turns: [
         {
           tool_calls: [
-            { id: "call_js", name: "run_browser_js", arguments: browserArgs("x", "1") },
+            { id: "call_js", name: "run_browser_code", arguments: browserArgs("x", "1") },
           ],
         },
         { content: "all done" },
@@ -189,7 +189,7 @@ test("POST /resume/stream returns SSE final without interrupt event", async () =
       turns: [
         {
           tool_calls: [
-            { id: "call_js", name: "run_browser_js", arguments: browserArgs("x", "1") },
+            { id: "call_js", name: "run_browser_code", arguments: browserArgs("x", "1") },
           ],
         },
         { content: "streamed done" },
@@ -243,7 +243,7 @@ test("checkpoint save failure yields 500 and no interrupt", async () => {
       turns: [
         {
           tool_calls: [
-            { id: "call_js", name: "run_browser_js", arguments: browserArgs("x", "1") },
+            { id: "call_js", name: "run_browser_code", arguments: browserArgs("x", "1") },
           ],
         },
       ],
@@ -275,7 +275,7 @@ test("concurrent resume: second request is 409", async () => {
       turns: [
         {
           tool_calls: [
-            { id: "call_js", name: "run_browser_js", arguments: browserArgs("x", "1") },
+            { id: "call_js", name: "run_browser_code", arguments: browserArgs("x", "1") },
           ],
         },
         { content: "slow final" },
@@ -317,7 +317,7 @@ test("lock is released after resume so a second run_id 404 is not a stuck 409", 
       turns: [
         {
           tool_calls: [
-            { id: "call_js", name: "run_browser_js", arguments: browserArgs("x", "1") },
+            { id: "call_js", name: "run_browser_code", arguments: browserArgs("x", "1") },
           ],
         },
         { content: "done" },

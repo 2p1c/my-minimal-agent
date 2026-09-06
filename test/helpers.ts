@@ -14,15 +14,35 @@ export type ScriptTurn =
       tool_calls: { id: string; name: string; arguments: string }[];
     };
 
+async function abortableDelay(ms: number, signal?: AbortSignal): Promise<void> {
+  if (signal?.aborted) {
+    const err = new Error("This operation was aborted");
+    err.name = "AbortError";
+    throw err;
+  }
+  if (ms <= 0) return;
+  await new Promise<void>((resolve, reject) => {
+    const t = setTimeout(() => {
+      signal?.removeEventListener("abort", onAbort);
+      resolve();
+    }, ms);
+    const onAbort = () => {
+      clearTimeout(t);
+      const err = new Error("This operation was aborted");
+      err.name = "AbortError";
+      reject(err);
+    };
+    signal?.addEventListener("abort", onAbort, { once: true });
+  });
+}
+
 export function scriptedClient(turns: ScriptTurn[], delayMs = 0): LlmClient {
   let i = 0;
   return {
     chat: {
       completions: {
-        async create() {
-          if (i > 0 && delayMs > 0) {
-            await new Promise((r) => setTimeout(r, delayMs));
-          }
+        async create(_body, options) {
+          await abortableDelay(delayMs, options?.signal);
           const turn = turns[i++];
           if (!turn) throw new Error("scripted LLM has no remaining turns");
           if ("tool_calls" in turn && turn.tool_calls) {

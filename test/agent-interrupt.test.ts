@@ -28,7 +28,7 @@ test("runWithMessages returns final outcome from scripted LLM", async () => {
   if (outcome.type === "final") assert.equal(outcome.content, "hello from script");
 });
 
-test("run_browser_js writes checkpoint, interrupts, and does not execute code", async () => {
+test("run_browser_code writes checkpoint, interrupts, and does not execute code", async () => {
   const { store, dir } = await tempStore();
   try {
     const tool = new RunBrowserJsTool();
@@ -49,7 +49,7 @@ test("run_browser_js writes checkpoint, interrupts, and does not execute code", 
           tool_calls: [
             {
               id: "call_js",
-              name: "run_browser_js",
+              name: "run_browser_code",
               arguments: browserArgs("make red", "document.body.style.background='red'"),
             },
           ],
@@ -63,7 +63,7 @@ test("run_browser_js writes checkpoint, interrupts, and does not execute code", 
     assert.ok(outcome.runId);
     assert.equal(outcome.pending.length, 1);
     assert.equal(outcome.pending[0].tool_call_id, "call_js");
-    assert.equal(outcome.pending[0].name, "run_browser_js");
+    assert.equal(outcome.pending[0].name, "run_browser_code");
     assert.equal(outcome.pending[0].summary, "make red");
     assert.equal(outcome.pending[0].code, "document.body.style.background='red'");
     const cp = await store.load(outcome.runId);
@@ -87,7 +87,7 @@ test("empty code does not interrupt and writes a tool error", async () => {
       turns: [
         {
           tool_calls: [
-            { id: "call_empty", name: "run_browser_js", arguments: browserArgs("noop", "   ") },
+            { id: "call_empty", name: "run_browser_code", arguments: browserArgs("noop", "   ") },
           ],
         },
         { content: "could not change the page" },
@@ -125,7 +125,7 @@ test("same turn: server tool runs first, then browser interrupt", async () => {
             { id: "call_s", name: "web_search", arguments: "{\"query\":\"q\"}" },
             {
               id: "call_js",
-              name: "run_browser_js",
+              name: "run_browser_code",
               arguments: browserArgs("banner", "console.log(1)"),
             },
           ],
@@ -158,7 +158,7 @@ test("resume with ok continues to final and deletes checkpoint", async () => {
           tool_calls: [
             {
               id: "call_js",
-              name: "run_browser_js",
+              name: "run_browser_code",
               arguments: browserArgs("red", "1+1"),
             },
           ],
@@ -179,7 +179,7 @@ test("resume with ok continues to final and deletes checkpoint", async () => {
     if (outcome.type === "final") assert.equal(outcome.content, "done painting");
     assert.equal(await store.load(interrupted.runId), null);
     assert.equal(events[0]?.type, "tool_result");
-    assert.equal(events[0]?.name, "run_browser_js");
+    assert.equal(events[0]?.name, "run_browser_code");
     assert.equal(events[events.length - 1]?.type, "final");
   } finally {
     await rm(dir, { recursive: true, force: true });
@@ -233,10 +233,10 @@ test("three error outcomes then next browser call does not interrupt", async () 
       checkpoints: store,
       maxSteps: 8,
       turns: [
-        { tool_calls: [{ id: "c1", name: "run_browser_js", arguments: js }] },
-        { tool_calls: [{ id: "c2", name: "run_browser_js", arguments: js }] },
-        { tool_calls: [{ id: "c3", name: "run_browser_js", arguments: js }] },
-        { tool_calls: [{ id: "c4", name: "run_browser_js", arguments: js }] },
+        { tool_calls: [{ id: "c1", name: "run_browser_code", arguments: js }] },
+        { tool_calls: [{ id: "c2", name: "run_browser_code", arguments: js }] },
+        { tool_calls: [{ id: "c3", name: "run_browser_code", arguments: js }] },
+        { tool_calls: [{ id: "c4", name: "run_browser_code", arguments: js }] },
         { content: "stopped after three failures" },
       ],
     });
@@ -274,9 +274,9 @@ test("ok outcome resets failure count so a later error can interrupt again", asy
     const agent = makeAgent({
       checkpoints: store,
       turns: [
-        { tool_calls: [{ id: "a", name: "run_browser_js", arguments: js }] },
-        { tool_calls: [{ id: "b", name: "run_browser_js", arguments: js }] },
-        { tool_calls: [{ id: "c", name: "run_browser_js", arguments: js }] },
+        { tool_calls: [{ id: "a", name: "run_browser_code", arguments: js }] },
+        { tool_calls: [{ id: "b", name: "run_browser_code", arguments: js }] },
+        { tool_calls: [{ id: "c", name: "run_browser_code", arguments: js }] },
         { content: "after reset" },
       ],
     });
@@ -311,8 +311,8 @@ test("rejected outcome does not increment failures", async () => {
     const agent = makeAgent({
       checkpoints: store,
       turns: [
-        { tool_calls: [{ id: "a", name: "run_browser_js", arguments: js }] },
-        { tool_calls: [{ id: "b", name: "run_browser_js", arguments: js }] },
+        { tool_calls: [{ id: "a", name: "run_browser_code", arguments: js }] },
+        { tool_calls: [{ id: "b", name: "run_browser_code", arguments: js }] },
         { content: "after reject" },
       ],
     });

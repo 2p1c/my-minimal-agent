@@ -85,7 +85,20 @@ function parseResumeBody(req: Request):
   return { ok: true, run_id, results: parsed };
 }
 
+function requestSignal(req: Request, res: Response): AbortSignal {
+  const ac = new AbortController();
+  // POST body 读完就会结束 request；只能看 response 是否被客户端掐掉。
+  res.on("close", () => {
+    if (!res.writableEnded && !ac.signal.aborted) ac.abort();
+  });
+  return ac.signal;
+}
+
 function sendJsonOutcome(res: Response, outcome: RunOutcome): void {
+  if (outcome.type === "cancelled") {
+    res.status(499).json({ error: "cancelled" });
+    return;
+  }
   if (outcome.type === "interrupt") {
     res.json({
       interrupt: true,
@@ -98,10 +111,15 @@ function sendJsonOutcome(res: Response, outcome: RunOutcome): void {
 }
 
 function writeSse(res: Response, event: string | undefined, data: unknown): void {
-  if (event) res.write(`event: ${event}\n`);
-  res.write(`data: ${JSON.stringify(data)}\n\n`);
-  const flushable = res as Response & { flush?: () => void };
-  flushable.flush?.();
+  if (res.writableEnded) return;
+  try {
+    if (event) res.write(`event: ${event}\n`);
+    res.write(`data: ${JSON.stringify(data)}\n\n`);
+    const flushable = res as Response & { flush?: () => void };
+    flushable.flush?.();
+  } catch {
+    // 客户端已断开
+  }
 }
 
 function onLoopEvent(res: Response): LoopListener {
@@ -111,7 +129,17 @@ function onLoopEvent(res: Response): LoopListener {
   };
 }
 
-async function sendStreamOutcome(res: Response, outcome: RunOutcome): Promise<void> {
+async function sendStreamOutcome(
+  res: Response,
+  outcome: RunOutcome,
+  signal?: AbortSignal,
+): Promise<void> {
+  if (res.writableEnded) return;
+  if (outcome.type === "cancelled") {
+    writeSse(res, "cancelled", { cancelled: true });
+    res.end();
+    return;
+  }
   if (outcome.type === "interrupt") {
     writeSse(res, "interrupt", { run_id: outcome.runId, pending: outcome.pending });
     res.end();
@@ -121,6 +149,13 @@ async function sendStreamOutcome(res: Response, outcome: RunOutcome): Promise<vo
   const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
   const units = Array.from(content);
   for (let i = 0; i < units.length; i += DELTA_CHUNK_SIZE) {
+    if (signal?.aborted || res.writableEnded) {
+      if (!res.writableEnded) {
+        writeSse(res, "cancelled", { cancelled: true });
+        res.end();
+      }
+      return;
+    }
     const chunk = units.slice(i, i + DELTA_CHUNK_SIZE).join("");
     await sleep(40);
     writeSse(res, undefined, { delta: chunk });
@@ -155,11 +190,11 @@ export function createApp(agent: mmagent): express.Express {
       return;
     }
     try {
-      // runWithMessages 会内部 prepend 协议提示词和 identity，所以这里直接传 Python 给的数组即可。
       const outcome = await agent.runWithMessages(
         parsed.messages as never,
         undefined,
         parsed.identity,
+        requestSignal(req, res),
       );
       sendJsonOutcome(res, outcome);
     } catch (e) {
@@ -182,12 +217,14 @@ export function createApp(agent: mmagent): express.Express {
     }
 
     try {
+      const signal = requestSignal(req, res);
       const outcome = await agent.runWithMessages(
         parsed.messages as never,
         onLoopEvent(res),
         parsed.identity,
+        signal,
       );
-      await sendStreamOutcome(res, outcome);
+      await sendStreamOutcome(res, outcome, signal);
     } catch (e) {
       const { body } = classifyError(e);
       writeSse(res, "error", body);
@@ -202,7 +239,12 @@ export function createApp(agent: mmagent): express.Express {
       return;
     }
     try {
-      const outcome = await agent.resume(parsed.run_id, parsed.results);
+      const outcome = await agent.resume(
+        parsed.run_id,
+        parsed.results,
+        undefined,
+        requestSignal(req, res),
+      );
       sendJsonOutcome(res, outcome);
     } catch (e) {
       if (e instanceof ResumeError) {
@@ -225,12 +267,14 @@ export function createApp(agent: mmagent): express.Express {
     }
 
     try {
+      const signal = requestSignal(req, res);
       const outcome = await agent.resume(
         parsed.run_id,
         parsed.results,
         onLoopEvent(res),
+        signal,
       );
-      await sendStreamOutcome(res, outcome);
+      await sendStreamOutcome(res, outcome, signal);
     } catch (e) {
       if (e instanceof ResumeError) {
         writeSse(res, "error", { error: e.error, detail: e.message });

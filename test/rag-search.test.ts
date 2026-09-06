@@ -341,7 +341,7 @@ test("resume does not re-expand /rag in checkpoint messages", async () => {
               id: "call_js",
               type: "function",
               function: {
-                name: "run_browser_js",
+                name: "run_browser_code",
                 arguments: browserArgs("x", "1"),
               },
             },
@@ -351,7 +351,7 @@ test("resume does not re-expand /rag in checkpoint messages", async () => {
       pending: [
         {
           toolCallId: "call_js",
-          name: "run_browser_js",
+          name: "run_browser_code",
           arguments: browserArgs("x", "1"),
         },
       ],

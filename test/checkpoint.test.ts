@@ -18,7 +18,7 @@ function sample(over: Partial<RunCheckpoint> = {}): RunCheckpoint {
     pending: [
       {
         toolCallId: "call_1",
-        name: "run_browser_js",
+        name: "run_browser_code",
         arguments: "{\"code\":\"x\"}",
       } satisfies PendingCall,
     ],
