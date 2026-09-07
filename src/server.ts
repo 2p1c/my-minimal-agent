@@ -7,7 +7,7 @@ import express from "express";
 import type { Request, Response } from "express";
 
 import { mmagent, ResumeError } from "./agent.js";
-import type { LoopEvent, LoopListener, ResumeResult, RunOutcome } from "./agent.js";
+import type { LoopEvent, LoopListener, ResumeResult, RunOutcome, TokenUsage } from "./agent.js";
 import { createTools } from "./tools/index.js";
 
 // 生产镜像 Dockerfile 会设 NODE_ENV=production，默认既不打 loop 日志也不下发 SSE。
@@ -94,9 +94,17 @@ function requestSignal(req: Request, res: Response): AbortSignal {
   return ac.signal;
 }
 
+function usagePayload(usage: TokenUsage): TokenUsage {
+  return {
+    prompt_tokens: usage.prompt_tokens,
+    completion_tokens: usage.completion_tokens,
+    total_tokens: usage.total_tokens,
+  };
+}
+
 function sendJsonOutcome(res: Response, outcome: RunOutcome): void {
   if (outcome.type === "cancelled") {
-    res.status(499).json({ error: "cancelled" });
+    res.status(499).json({ error: "cancelled", usage: usagePayload(outcome.usage) });
     return;
   }
   if (outcome.type === "interrupt") {
@@ -104,10 +112,15 @@ function sendJsonOutcome(res: Response, outcome: RunOutcome): void {
       interrupt: true,
       run_id: outcome.runId,
       pending: outcome.pending,
+      usage: usagePayload(outcome.usage),
     });
     return;
   }
-  res.json({ role: "assistant", content: outcome.content });
+  res.json({
+    role: "assistant",
+    content: outcome.content,
+    usage: usagePayload(outcome.usage),
+  });
 }
 
 function writeSse(res: Response, event: string | undefined, data: unknown): void {
@@ -136,12 +149,16 @@ async function sendStreamOutcome(
 ): Promise<void> {
   if (res.writableEnded) return;
   if (outcome.type === "cancelled") {
-    writeSse(res, "cancelled", { cancelled: true });
+    writeSse(res, "cancelled", { cancelled: true, usage: usagePayload(outcome.usage) });
     res.end();
     return;
   }
   if (outcome.type === "interrupt") {
-    writeSse(res, "interrupt", { run_id: outcome.runId, pending: outcome.pending });
+    writeSse(res, "interrupt", {
+      run_id: outcome.runId,
+      pending: outcome.pending,
+      usage: usagePayload(outcome.usage),
+    });
     res.end();
     return;
   }
@@ -151,7 +168,7 @@ async function sendStreamOutcome(
   for (let i = 0; i < units.length; i += DELTA_CHUNK_SIZE) {
     if (signal?.aborted || res.writableEnded) {
       if (!res.writableEnded) {
-        writeSse(res, "cancelled", { cancelled: true });
+        writeSse(res, "cancelled", { cancelled: true, usage: usagePayload(outcome.usage) });
         res.end();
       }
       return;
@@ -160,7 +177,11 @@ async function sendStreamOutcome(
     await sleep(40);
     writeSse(res, undefined, { delta: chunk });
   }
-  writeSse(res, undefined, { done: true, message: { role: "assistant", content } });
+  writeSse(res, undefined, {
+    done: true,
+    message: { role: "assistant", content },
+    usage: usagePayload(outcome.usage),
+  });
   res.write("data: [DONE]\n\n");
   res.end();
 }
@@ -180,6 +201,30 @@ export function createApp(agent: mmagent): express.Express {
   // 健康检查：运维探活。
   app.get("/health", (_req: Request, res: Response) => {
     res.json({ status: "ok" });
+  });
+
+  // /compact：压缩 old 消息，不跑工具循环。
+  app.post("/compact", async (req: Request, res: Response) => {
+    const parsed = parseBody(req);
+    if (!parsed.ok) {
+      res.status(400).json({ error: "bad_request", detail: parsed.detail });
+      return;
+    }
+    try {
+      const result = await agent.compact(
+        parsed.messages as never,
+        requestSignal(req, res),
+      );
+      res.json({
+        compacted: result.compacted,
+        skipped: result.skipped,
+        notice: result.notice,
+        usage: usagePayload(result.usage),
+      });
+    } catch (e) {
+      const { status, body } = classifyError(e);
+      res.status(status).json(body);
+    }
   });
 
   // 一次性完成：跑完整 Agent 循环，返回最终的 assistant 消息。

@@ -8,6 +8,14 @@ import { IDENTITY, SYSTEM_PROMPT } from "./prompts.js";
 import type { Tool } from "./tools/types.js";
 import { applyRagSlash } from "./tools/rag-search.js";
 import {
+  compactPromptMessages,
+  compactedMessages,
+  NOTICE_COMPACTED,
+  NOTICE_SKIPPED,
+  partitionForCompact,
+  stripTrailingCompact,
+} from "./compact.js";
+import {
   FileCheckpointStore,
   type CheckpointStore,
   type PendingCall,
@@ -16,6 +24,44 @@ import {
 export const BROWSER_EVAL_FAILURE_LIMIT = 3;
 export const BROWSER_EVAL_STOPPED_MESSAGE =
   "已连续失败 3 次，停止改页面，向用户说明原因";
+
+export type TokenUsage = {
+  prompt_tokens: number;
+  completion_tokens: number;
+  total_tokens: number;
+};
+
+export function emptyUsage(): TokenUsage {
+  return { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 };
+}
+
+function asNonNegInt(value: unknown): number {
+  if (typeof value !== "number" || !Number.isFinite(value)) return 0;
+  return Math.max(0, Math.trunc(value));
+}
+
+export function readUsage(response: {
+  usage?: {
+    prompt_tokens?: number;
+    completion_tokens?: number;
+    total_tokens?: number;
+  } | null;
+}): TokenUsage {
+  const u = response.usage;
+  if (!u) return emptyUsage();
+  const prompt_tokens = asNonNegInt(u.prompt_tokens);
+  const completion_tokens = asNonNegInt(u.completion_tokens);
+  const total_tokens = asNonNegInt(u.total_tokens) || prompt_tokens + completion_tokens;
+  return { prompt_tokens, completion_tokens, total_tokens };
+}
+
+export function addUsage(a: TokenUsage, b: TokenUsage): TokenUsage {
+  return {
+    prompt_tokens: a.prompt_tokens + b.prompt_tokens,
+    completion_tokens: a.completion_tokens + b.completion_tokens,
+    total_tokens: a.total_tokens + b.total_tokens,
+  };
+}
 
 type LoopContext = {
   runId?: string;
@@ -71,10 +117,10 @@ function toInterruptPending(call: PendingCall): InterruptPending {
 }
 
 export type RunOutcome =
-  | { type: "final"; content: string }
-  | { type: "max_steps"; content: string }
-  | { type: "interrupt"; runId: string; pending: InterruptPending[] }
-  | { type: "cancelled" };
+  | { type: "final"; content: string; usage: TokenUsage }
+  | { type: "max_steps"; content: string; usage: TokenUsage }
+  | { type: "interrupt"; runId: string; pending: InterruptPending[]; usage: TokenUsage }
+  | { type: "cancelled"; usage: TokenUsage };
 
 export type ResumeResult = {
   tool_call_id: string;
@@ -122,6 +168,11 @@ export type LlmClient = {
             tool_calls?: OpenAI.ChatCompletionMessageToolCall[];
           };
         }>;
+        usage?: {
+          prompt_tokens?: number;
+          completion_tokens?: number;
+          total_tokens?: number;
+        } | null;
       }>;
     };
   };
@@ -275,6 +326,52 @@ export class mmagent {
     );
   }
 
+  // /compact：确定性压缩，不走工具循环。末尾的 /compact 用户消息会被丢掉。
+  async compact(
+    messages: ChatMessage[],
+    signal?: AbortSignal,
+  ): Promise<{
+    compacted: ChatMessage[];
+    skipped: boolean;
+    notice: string;
+    usage: TokenUsage;
+  }> {
+    const source = stripTrailingCompact(messages);
+    const { old, recent, skipped } = partitionForCompact(source);
+    if (skipped) {
+      return {
+        compacted: source,
+        skipped: true,
+        notice: NOTICE_SKIPPED,
+        usage: emptyUsage(),
+      };
+    }
+    let response: Awaited<ReturnType<LlmClient["chat"]["completions"]["create"]>>;
+    try {
+      response = await this.client.chat.completions.create(
+        {
+          model: this.model,
+          messages: compactPromptMessages(old),
+        },
+        { signal },
+      );
+    } catch (e) {
+      if (signal?.aborted || isAbortError(e)) {
+        const err = new Error("This operation was aborted");
+        err.name = "AbortError";
+        throw err;
+      }
+      throw e;
+    }
+    const summary = response.choices[0]?.message?.content ?? "";
+    return {
+      compacted: compactedMessages(summary, recent),
+      skipped: false,
+      notice: NOTICE_COMPACTED,
+      usage: readUsage(response),
+    };
+  }
+
   async resume(
     runId: string,
     results: ResumeResult[],
@@ -340,9 +437,9 @@ export class mmagent {
     }
   }
 
-  private async cancelled(runId?: string): Promise<RunOutcome> {
+  private async cancelled(runId?: string, usage: TokenUsage = emptyUsage()): Promise<RunOutcome> {
     if (runId) await this.checkpoints.delete(runId);
-    return { type: "cancelled" };
+    return { type: "cancelled", usage };
   }
 
   // 共享的 ReAct 循环：把消息数组发给模型，按工具调用结果决定下一步或返回最终文本。
@@ -353,10 +450,11 @@ export class mmagent {
     signal?: AbortSignal,
   ): Promise<RunOutcome> {
     const emit = (event: LoopEvent) => emitLoop(onEvent, event);
+    let usage = emptyUsage();
 
     // for 循环，最多执行 maxSteps 轮。可从 checkpoint 的 stepsUsed 续跑；对外事件用 1-based。
     for (let step = ctx.stepsUsed; step < this.maxSteps; step++) {
-      if (signal?.aborted) return this.cancelled(ctx.runId);
+      if (signal?.aborted) return this.cancelled(ctx.runId, usage);
       const stepNum = step + 1;
       // 调用 OpenAI 的聊天补全接口，拿到模型回复。
       // `await` 会等待网络请求完成后才继续执行下一行。
@@ -372,9 +470,10 @@ export class mmagent {
           { signal },
         );
       } catch (e) {
-        if (signal?.aborted || isAbortError(e)) return this.cancelled(ctx.runId);
+        if (signal?.aborted || isAbortError(e)) return this.cancelled(ctx.runId, usage);
         throw e;
       }
+      usage = addUsage(usage, readUsage(response));
 
       // 取第一条回复（choices 是候选回复列表，通常只用第一个）。
       const msg = response.choices[0].message;
@@ -518,7 +617,7 @@ export class mmagent {
             createdAt: ctx.createdAt ?? now,
             updatedAt: now,
           });
-          if (signal?.aborted) return this.cancelled(runId);
+          if (signal?.aborted) return this.cancelled(runId, usage);
           const interruptPending = pending.map(toInterruptPending);
           emit({
             type: "interrupt",
@@ -526,7 +625,7 @@ export class mmagent {
             runId,
             pending: interruptPending,
           });
-          return { type: "interrupt", runId, pending: interruptPending };
+          return { type: "interrupt", runId, pending: interruptPending, usage };
         }
       } else {
         // 模型没有调用工具，说明它已经给出最终答案，直接返回它的文本。
@@ -536,7 +635,7 @@ export class mmagent {
           await this.checkpoints.delete(ctx.runId);
         }
         emit({ type: "final", step: stepNum, content });
-        return { type: "final", content };
+        return { type: "final", content, usage };
       }
     }
 
@@ -546,6 +645,6 @@ export class mmagent {
       await this.checkpoints.delete(ctx.runId);
     }
     emit({ type: "max_steps", step: this.maxSteps, content: exhausted });
-    return { type: "max_steps", content: exhausted };
+    return { type: "max_steps", content: exhausted, usage };
   }
 }

@@ -171,7 +171,11 @@ test("POST /resume with ok returns final assistant and deletes snapshot", async 
         }),
       });
       assert.equal(resumed.status, 200);
-      assert.deepEqual(await resumed.json(), { role: "assistant", content: "all done" });
+      assert.deepEqual(await resumed.json(), {
+        role: "assistant",
+        content: "all done",
+        usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+      });
       assert.equal(await store.load(interrupted.run_id), null);
     } finally {
       await close();
@@ -300,7 +304,11 @@ test("concurrent resume: second request is 409", async () => {
       const statuses = [a.status, b.status].sort();
       assert.deepEqual(statuses, [200, 409]);
       const win = a.status === 200 ? a : b;
-      assert.deepEqual(await win.json(), { role: "assistant", content: "slow final" });
+      assert.deepEqual(await win.json(), {
+        role: "assistant",
+        content: "slow final",
+        usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+      });
     } finally {
       await close();
     }

@@ -2,16 +2,17 @@ import { mkdtemp } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import type OpenAI from "openai";
-import { mmagent, type LlmClient } from "../src/agent.js";
+import { mmagent, type LlmClient, type TokenUsage } from "../src/agent.js";
 import { FileCheckpointStore, type CheckpointStore } from "../src/checkpoint.js";
 import type { Tool } from "../src/tools/types.js";
 import { RunBrowserJsTool } from "../src/tools/run-browser-js.js";
 
 export type ScriptTurn =
-  | { content: string }
+  | { content: string; usage?: TokenUsage }
   | {
       content?: string | null;
       tool_calls: { id: string; name: string; arguments: string }[];
+      usage?: TokenUsage;
     };
 
 async function abortableDelay(ms: number, signal?: AbortSignal): Promise<void> {
@@ -59,9 +60,10 @@ export function scriptedClient(turns: ScriptTurn[], delayMs = 0): LlmClient {
                   },
                 },
               ],
+              usage: turn.usage,
             };
           }
-          return { choices: [{ message: { content: turn.content } }] };
+          return { choices: [{ message: { content: turn.content } }], usage: turn.usage };
         },
       },
     },
