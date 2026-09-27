@@ -6,6 +6,7 @@ import { resolve } from "node:path";
 import express from "express";
 import type { Request, Response } from "express";
 
+import { AdmissionGate, SaturatedError } from "./admission.js";
 import { mmagent, ResumeError } from "./agent.js";
 import type { LoopEvent, LoopListener, ResumeResult, RunOutcome, TokenUsage } from "./agent.js";
 import { createTools } from "./tools/index.js";
@@ -19,9 +20,6 @@ const LOOP_EVENTS =
 const LOOP_LOG =
   process.env.AGENT_LOOP_LOG === "1" ||
   (process.env.AGENT_LOOP_LOG !== "0" && !isProd);
-
-// SSE 流式渲染时每个 delta 的 Unicode 码点数。8 左右能给出打字机感，又不会让事件数爆炸。
-const DELTA_CHUNK_SIZE = 8;
 
 const OUTCOMES = new Set(["ok", "error", "rejected"]);
 
@@ -85,6 +83,57 @@ function parseResumeBody(req: Request):
   return { ok: true, run_id, results: parsed };
 }
 
+// 满员时让客户端隔 1 秒再试。这是提示，不是承诺。
+const RETRY_AFTER_SEC = "1";
+
+function envInt(name: string, fallback: number, min: number): number {
+  const raw = process.env[name];
+  if (raw === undefined || raw.trim() === "") return fallback;
+  const n = Number(raw);
+  if (!Number.isInteger(n) || n < min) return fallback;
+  return n;
+}
+
+function isAbortError(e: unknown): boolean {
+  return !!e && typeof e === "object" && (e as { name?: string }).name === "AbortError";
+}
+
+function canWrite(res: Response): boolean {
+  return !res.headersSent && !res.writableEnded && !res.destroyed;
+}
+
+type Lease = { signal: AbortSignal; release: () => void };
+
+// 拿到名额才继续。队列已满返回 429；排队期间客户端断开则放弃，不启动 Agent。
+async function admit(req: Request, res: Response, gate: AdmissionGate): Promise<Lease | undefined> {
+  const signal = requestSignal(req, res);
+  try {
+    const release = await gate.acquire(signal);
+    if (signal.aborted) {
+      release();
+      if (canWrite(res)) res.status(499).json({ error: "cancelled" });
+      return undefined;
+    }
+    return { signal, release };
+  } catch (e) {
+    if (e instanceof SaturatedError) {
+      if (canWrite(res)) {
+        res.setHeader("Retry-After", RETRY_AFTER_SEC);
+        res.status(429).json({
+          error: "overloaded",
+          detail: "too many concurrent agent runs",
+        });
+      }
+      return undefined;
+    }
+    if (isAbortError(e)) {
+      if (canWrite(res)) res.status(499).json({ error: "cancelled" });
+      return undefined;
+    }
+    throw e;
+  }
+}
+
 function requestSignal(req: Request, res: Response): AbortSignal {
   const ac = new AbortController();
   // POST body 读完就会结束 request；只能看 response 是否被客户端掐掉。
@@ -142,11 +191,8 @@ function onLoopEvent(res: Response): LoopListener {
   };
 }
 
-async function sendStreamOutcome(
-  res: Response,
-  outcome: RunOutcome,
-  signal?: AbortSignal,
-): Promise<void> {
+// 正文 delta 已在模型生成时写过。这里只补上没流过的收尾文本（例如步数耗尽），然后发 done。
+function sendStreamOutcome(res: Response, outcome: RunOutcome, streamed: boolean): void {
   if (res.writableEnded) return;
   if (outcome.type === "cancelled") {
     writeSse(res, "cancelled", { cancelled: true, usage: usagePayload(outcome.usage) });
@@ -162,24 +208,12 @@ async function sendStreamOutcome(
     res.end();
     return;
   }
-  const content = outcome.content;
-  const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
-  const units = Array.from(content);
-  for (let i = 0; i < units.length; i += DELTA_CHUNK_SIZE) {
-    if (signal?.aborted || res.writableEnded) {
-      if (!res.writableEnded) {
-        writeSse(res, "cancelled", { cancelled: true, usage: usagePayload(outcome.usage) });
-        res.end();
-      }
-      return;
-    }
-    const chunk = units.slice(i, i + DELTA_CHUNK_SIZE).join("");
-    await sleep(40);
-    writeSse(res, undefined, { delta: chunk });
+  if (outcome.type === "max_steps" || !streamed) {
+    if (outcome.content) writeSse(res, undefined, { delta: outcome.content });
   }
   writeSse(res, undefined, {
     done: true,
-    message: { role: "assistant", content },
+    message: { role: "assistant", content: outcome.content },
     usage: usagePayload(outcome.usage),
   });
   res.write("data: [DONE]\n\n");
@@ -194,7 +228,17 @@ function setSseHeaders(res: Response): void {
   res.flushHeaders?.();
 }
 
-export function createApp(agent: mmagent): express.Express {
+export type CreateAppOptions = {
+  admission?: AdmissionGate;
+};
+
+export function createApp(agent: mmagent, options: CreateAppOptions = {}): express.Express {
+  // 同时在跑的 Agent 默认 8 个，短突发最多再排 16 个。再多直接 429，
+  // 避免对话内存、连接和上游配额一起被打满。可用环境变量覆盖。
+  const gate =
+    options.admission ??
+    new AdmissionGate(envInt("AGENT_MAX_INFLIGHT", 8, 1), envInt("AGENT_MAX_WAITING", 16, 0));
+
   const app = express();
   app.use(express.json({ limit: "1mb" }));
 
@@ -210,11 +254,10 @@ export function createApp(agent: mmagent): express.Express {
       res.status(400).json({ error: "bad_request", detail: parsed.detail });
       return;
     }
+    const lease = await admit(req, res, gate);
+    if (!lease) return;
     try {
-      const result = await agent.compact(
-        parsed.messages as never,
-        requestSignal(req, res),
-      );
+      const result = await agent.compact(parsed.messages as never, lease.signal);
       res.json({
         compacted: result.compacted,
         skipped: result.skipped,
@@ -224,6 +267,8 @@ export function createApp(agent: mmagent): express.Express {
     } catch (e) {
       const { status, body } = classifyError(e);
       res.status(status).json(body);
+    } finally {
+      lease.release();
     }
   });
 
@@ -234,47 +279,64 @@ export function createApp(agent: mmagent): express.Express {
       res.status(400).json({ error: "bad_request", detail: parsed.detail });
       return;
     }
+    const lease = await admit(req, res, gate);
+    if (!lease) return;
     try {
       const outcome = await agent.runWithMessages(
         parsed.messages as never,
         undefined,
         parsed.identity,
-        requestSignal(req, res),
+        lease.signal,
       );
       sendJsonOutcome(res, outcome);
     } catch (e) {
       const { status, body } = classifyError(e);
       res.status(status).json(body);
+    } finally {
+      lease.release();
     }
   });
 
-  // 流式完成：Agent 同步跑完循环拿到 final answer 后，按小 chunk 通过 SSE 渲染出来。
-  // 工具调用完全在容器内完成，Python 端只看到最终文本的"打字机"效果。
+  // 流式完成：模型每吐出一段正文就写一条 delta。工具仍在服务端执行。
+  // 同一轮里先写字再调工具时，那些字也会作为 delta 发出；done 的 content 只含最终回答。
   app.post("/complete/stream", async (req: Request, res: Response) => {
-    // 先设 SSE 头，再校验入参——保证错误也能走 SSE 通道。
-    setSseHeaders(res);
-
     const parsed = parseBody(req);
     if (!parsed.ok) {
+      // 入参错误仍走 SSE，和原来一样。过载在设 SSE 头之前用 429 拒绝，客户端能按状态码重试。
+      setSseHeaders(res);
       writeSse(res, "error", { error: "bad_request", detail: parsed.detail });
       res.end();
       return;
     }
 
+    const lease = await admit(req, res, gate);
+    if (!lease) return;
+    setSseHeaders(res);
+
+    let streamed = false;
+    const onDelta = (text: string) => {
+      streamed = true;
+      writeSse(res, undefined, { delta: text });
+    };
+
+    let outcome: RunOutcome;
     try {
-      const signal = requestSignal(req, res);
-      const outcome = await agent.runWithMessages(
+      outcome = await agent.runWithMessages(
         parsed.messages as never,
         onLoopEvent(res),
         parsed.identity,
-        signal,
+        lease.signal,
+        onDelta,
       );
-      await sendStreamOutcome(res, outcome, signal);
     } catch (e) {
       const { body } = classifyError(e);
       writeSse(res, "error", body);
       res.end();
+      return;
+    } finally {
+      lease.release();
     }
+    sendStreamOutcome(res, outcome, streamed);
   });
 
   app.post("/resume", async (req: Request, res: Response) => {
@@ -283,12 +345,14 @@ export function createApp(agent: mmagent): express.Express {
       res.status(400).json({ error: "bad_request", detail: parsed.detail });
       return;
     }
+    const lease = await admit(req, res, gate);
+    if (!lease) return;
     try {
       const outcome = await agent.resume(
         parsed.run_id,
         parsed.results,
         undefined,
-        requestSignal(req, res),
+        lease.signal,
       );
       sendJsonOutcome(res, outcome);
     } catch (e) {
@@ -298,28 +362,39 @@ export function createApp(agent: mmagent): express.Express {
       }
       const { status, body } = classifyError(e);
       res.status(status).json(body);
+    } finally {
+      lease.release();
     }
   });
 
   app.post("/resume/stream", async (req: Request, res: Response) => {
-    setSseHeaders(res);
-
     const parsed = parseResumeBody(req);
     if (!parsed.ok) {
+      setSseHeaders(res);
       writeSse(res, "error", { error: "bad_request", detail: parsed.detail });
       res.end();
       return;
     }
 
+    const lease = await admit(req, res, gate);
+    if (!lease) return;
+    setSseHeaders(res);
+
+    let streamed = false;
+    const onDelta = (text: string) => {
+      streamed = true;
+      writeSse(res, undefined, { delta: text });
+    };
+
+    let outcome: RunOutcome;
     try {
-      const signal = requestSignal(req, res);
-      const outcome = await agent.resume(
+      outcome = await agent.resume(
         parsed.run_id,
         parsed.results,
         onLoopEvent(res),
-        signal,
+        lease.signal,
+        onDelta,
       );
-      await sendStreamOutcome(res, outcome, signal);
     } catch (e) {
       if (e instanceof ResumeError) {
         writeSse(res, "error", { error: e.error, detail: e.message });
@@ -329,7 +404,11 @@ export function createApp(agent: mmagent): express.Express {
       const { body } = classifyError(e);
       writeSse(res, "error", body);
       res.end();
+      return;
+    } finally {
+      lease.release();
     }
+    sendStreamOutcome(res, outcome, streamed);
   });
 
   return app;

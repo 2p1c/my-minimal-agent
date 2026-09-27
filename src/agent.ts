@@ -150,6 +150,24 @@ export class ResumeError extends Error {
   }
 }
 
+// 流式补全的一块。正文和工具参数都是增量，调用方自己拼接。
+export type LlmToolCallDelta = {
+  index: number;
+  id?: string;
+  name?: string;
+  arguments?: string;
+};
+
+export type LlmChunk = {
+  content?: string;
+  toolCallDeltas?: LlmToolCallDelta[];
+  usage?: {
+    prompt_tokens?: number;
+    completion_tokens?: number;
+    total_tokens?: number;
+  } | null;
+};
+
 export type LlmClient = {
   chat: {
     completions: {
@@ -161,25 +179,107 @@ export type LlmClient = {
           tool_choice?: "auto";
         },
         options?: { signal?: AbortSignal },
-      ) => Promise<{
-        choices: Array<{
-          message: {
-            content?: string | null;
-            tool_calls?: OpenAI.ChatCompletionMessageToolCall[];
-          };
-        }>;
-        usage?: {
-          prompt_tokens?: number;
-          completion_tokens?: number;
-          total_tokens?: number;
-        } | null;
-      }>;
+      ) => Promise<AsyncIterable<LlmChunk>>;
     };
   };
 };
 
 function isAbortError(e: unknown): boolean {
   return !!e && typeof e === "object" && (e as { name?: string }).name === "AbortError";
+}
+
+function abortError(): Error {
+  const err = new Error("This operation was aborted");
+  err.name = "AbortError";
+  return err;
+}
+
+function emitDelta(onDelta: ((text: string) => void) | undefined, text: string): void {
+  if (!onDelta || !text) return;
+  try {
+    onDelta(text);
+  } catch {
+    // 观察者抛错不能让对话失败。
+  }
+}
+
+function appendToolCallDeltas(acc: LlmToolCallDelta[], deltas: LlmToolCallDelta[]): void {
+  for (const d of deltas) {
+    if (!Number.isInteger(d.index) || d.index < 0) continue;
+    while (acc.length <= d.index) acc.push({ index: acc.length });
+    const slot = acc[d.index];
+    if (d.id) slot.id = (slot.id ?? "") + d.id;
+    if (d.name) slot.name = (slot.name ?? "") + d.name;
+    if (d.arguments) slot.arguments = (slot.arguments ?? "") + d.arguments;
+  }
+}
+
+function toToolCalls(acc: LlmToolCallDelta[]): OpenAI.ChatCompletionMessageToolCall[] {
+  const calls: OpenAI.ChatCompletionMessageFunctionToolCall[] = [];
+  for (const slot of acc) {
+    if (!slot.id && !slot.name && !slot.arguments) continue;
+    calls.push({
+      id: slot.id ?? "",
+      type: "function",
+      function: { name: slot.name ?? "", arguments: slot.arguments ?? "" },
+    });
+  }
+  return calls;
+}
+
+// 真实 SDK 走流式。测试注入的 client 直接产出 LlmChunk，不经过这里。
+function openAIStreamClient(baseURL?: string): LlmClient {
+  const sdk = new OpenAI({
+    apiKey: process.env.OPENAI_API_KEY,
+    baseURL,
+  });
+  return {
+    chat: {
+      completions: {
+        async create(body, options) {
+          const stream = await sdk.chat.completions.create(
+            {
+              model: body.model,
+              messages: body.messages,
+              ...(body.tools
+                ? { tools: body.tools, tool_choice: body.tool_choice }
+                : {}),
+              stream: true,
+              stream_options: { include_usage: true },
+            },
+            { signal: options?.signal },
+          );
+          return mapOpenAIStream(stream);
+        },
+      },
+    },
+  };
+}
+
+async function* mapOpenAIStream(
+  stream: AsyncIterable<OpenAI.ChatCompletionChunk>,
+): AsyncGenerator<LlmChunk> {
+  for await (const chunk of stream) {
+    const delta = chunk.choices[0]?.delta;
+    const content = delta?.content || undefined;
+    const toolCallDeltas = delta?.tool_calls?.flatMap((tc) => {
+      if (tc.type === "custom") return [];
+      return [
+        {
+          index: tc.index,
+          id: tc.id,
+          name: tc.function?.name,
+          arguments: tc.function?.arguments,
+        },
+      ];
+    });
+    if (!content && !toolCallDeltas?.length && !chunk.usage) continue;
+    yield {
+      content,
+      toolCallDeltas: toolCallDeltas?.length ? toolCallDeltas : undefined,
+      usage: chunk.usage,
+    };
+  }
 }
 
 export type AgentDeps = {
@@ -256,15 +356,9 @@ export class mmagent {
     private identity = IDENTITY, // 默认人设；HTTP 可用请求体 identity 按次覆盖
     deps: AgentDeps = {},
   ) {
-    // 创建 OpenAI 客户端。apiKey 从环境变量读取（顶层的 dotenv 已把 .env 加载进 process.env）。
-    // baseURL 若未提供则为 undefined，SDK 会使用默认的 OpenAI 官方地址。
+    // 默认走 OpenAI 流式客户端。apiKey 从环境变量读取（server 入口的 dotenv 已加载）。
     // 测试可注入 deps.client，避免真实网络调用。
-    this.client =
-      deps.client ??
-      new OpenAI({
-        apiKey: process.env.OPENAI_API_KEY,
-        baseURL,
-      });
+    this.client = deps.client ?? openAIStreamClient(baseURL);
     this.checkpoints = deps.checkpoints ?? new FileCheckpointStore();
 
     // 把数组转成 Map 字典：
@@ -308,11 +402,13 @@ export class mmagent {
   // HTTP 入口：接受外部传入的完整 messages 数组（含 user/assistant/tool/system 等）。
   // 始终把 SYSTEM_PROMPT prepend 到最前；identity 未传则用构造时的默认人设，传空字符串则不加身份层。
   // onEvent 可选：每一步 loop 回调一次，供本地调试；不传则行为与原来完全一样。
+  // onDelta：模型吐出的正文片段。流式 HTTP 用它立刻写 SSE；不传则只在内部拼完整回复。
   async runWithMessages(
     messages: ChatMessage[],
     onEvent?: LoopListener,
     identity?: string,
     signal?: AbortSignal,
+    onDelta?: (text: string) => void,
   ): Promise<RunOutcome> {
     const prepared = await applyRagSlash(
       messages,
@@ -323,6 +419,7 @@ export class mmagent {
       onEvent,
       undefined,
       signal,
+      onDelta,
     );
   }
 
@@ -346,30 +443,21 @@ export class mmagent {
         usage: emptyUsage(),
       };
     }
-    let response: Awaited<ReturnType<LlmClient["chat"]["completions"]["create"]>>;
     try {
-      response = await this.client.chat.completions.create(
-        {
-          model: this.model,
-          messages: compactPromptMessages(old),
-        },
-        { signal },
+      const completion = await this.readCompletion(
+        { messages: compactPromptMessages(old) },
+        signal,
       );
+      return {
+        compacted: compactedMessages(completion.content, recent),
+        skipped: false,
+        notice: NOTICE_COMPACTED,
+        usage: completion.usage,
+      };
     } catch (e) {
-      if (signal?.aborted || isAbortError(e)) {
-        const err = new Error("This operation was aborted");
-        err.name = "AbortError";
-        throw err;
-      }
+      if (signal?.aborted || isAbortError(e)) throw abortError();
       throw e;
     }
-    const summary = response.choices[0]?.message?.content ?? "";
-    return {
-      compacted: compactedMessages(summary, recent),
-      skipped: false,
-      notice: NOTICE_COMPACTED,
-      usage: readUsage(response),
-    };
   }
 
   async resume(
@@ -377,6 +465,7 @@ export class mmagent {
     results: ResumeResult[],
     onEvent?: LoopListener,
     signal?: AbortSignal,
+    onDelta?: (text: string) => void,
   ): Promise<RunOutcome> {
     if (this.inflight.has(runId)) {
       throw new ResumeError("conflict", `run ${runId} is already resuming`);
@@ -431,6 +520,7 @@ export class mmagent {
           createdAt: checkpoint.createdAt,
         },
         signal,
+        onDelta,
       );
     } finally {
       this.inflight.delete(runId);
@@ -443,11 +533,59 @@ export class mmagent {
   }
 
   // 共享的 ReAct 循环：把消息数组发给模型，按工具调用结果决定下一步或返回最终文本。
+  // 读完一轮流式补全。正文字块立刻交给 onDelta；工具调用按 index 拼完整后才返回。
+  private async readCompletion(
+    body: {
+      messages: ChatMessage[];
+      tools?: OpenAI.ChatCompletionTool[];
+      tool_choice?: "auto";
+    },
+    signal?: AbortSignal,
+    onDelta?: (text: string) => void,
+  ): Promise<{
+    content: string;
+    toolCalls: OpenAI.ChatCompletionMessageToolCall[];
+    usage: TokenUsage;
+  }> {
+    if (signal?.aborted) throw abortError();
+    const request: {
+      model: string;
+      messages: ChatMessage[];
+      tools?: OpenAI.ChatCompletionTool[];
+      tool_choice?: "auto";
+    } = { model: this.model, messages: body.messages };
+    if (body.tools) {
+      request.tools = body.tools;
+      request.tool_choice = body.tool_choice ?? "auto";
+    }
+
+    let content = "";
+    const acc: LlmToolCallDelta[] = [];
+    let usage = emptyUsage();
+    try {
+      const stream = await this.client.chat.completions.create(request, { signal });
+      for await (const chunk of stream) {
+        if (signal?.aborted) throw abortError();
+        if (chunk.content) {
+          content += chunk.content;
+          emitDelta(onDelta, chunk.content);
+        }
+        if (chunk.toolCallDeltas) appendToolCallDeltas(acc, chunk.toolCallDeltas);
+        if (chunk.usage) usage = readUsage({ usage: chunk.usage });
+      }
+    } catch (e) {
+      if (signal?.aborted || isAbortError(e)) throw abortError();
+      throw e;
+    }
+    return { content, toolCalls: toToolCalls(acc), usage };
+  }
+
   private async runLoop(
     messages: ChatMessage[],
     onEvent?: LoopListener,
     ctx: LoopContext = { browserEvalFailures: 0, stepsUsed: 0 },
     signal?: AbortSignal,
+    onDelta?: (text: string) => void,
   ): Promise<RunOutcome> {
     const emit = (event: LoopEvent) => emitLoop(onEvent, event);
     let usage = emptyUsage();
@@ -456,27 +594,28 @@ export class mmagent {
     for (let step = ctx.stepsUsed; step < this.maxSteps; step++) {
       if (signal?.aborted) return this.cancelled(ctx.runId, usage);
       const stepNum = step + 1;
-      // 调用 OpenAI 的聊天补全接口，拿到模型回复。
-      // `await` 会等待网络请求完成后才继续执行下一行。
-      let response: Awaited<ReturnType<LlmClient["chat"]["completions"]["create"]>>;
+      // 流式读这一轮。正文已经通过 onDelta 推给调用方；这里拿到拼好的消息再决定是否调工具。
+      let completion;
       try {
-        response = await this.client.chat.completions.create(
+        completion = await this.readCompletion(
           {
-            model: this.model,
             messages, // 整个对话历史
             tools: this.toolSchemas, // 告诉模型它有哪些工具可用
             tool_choice: "auto", // 允许模型自主决定是否调用工具
           },
-          { signal },
+          signal,
+          onDelta,
         );
       } catch (e) {
         if (signal?.aborted || isAbortError(e)) return this.cancelled(ctx.runId, usage);
         throw e;
       }
-      usage = addUsage(usage, readUsage(response));
+      usage = addUsage(usage, completion.usage);
 
-      // 取第一条回复（choices 是候选回复列表，通常只用第一个）。
-      const msg = response.choices[0].message;
+      const msg = {
+        content: completion.content || null,
+        tool_calls: completion.toolCalls.length > 0 ? completion.toolCalls : undefined,
+      };
 
       // 如果模型回复里带了工具调用请求，就执行这些工具。
       // `msg.tool_calls` 在模型没调用工具时是 undefined，所以先判断“存在且有内容”。

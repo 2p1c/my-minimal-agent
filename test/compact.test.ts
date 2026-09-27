@@ -16,7 +16,7 @@ import {
 } from "../src/compact.js";
 import { createApp } from "../src/server.js";
 import { mmagent } from "../src/agent.js";
-import { makeAgent } from "./helpers.js";
+import { llmChunks, makeAgent } from "./helpers.js";
 
 type ChatMessage = OpenAI.ChatCompletionMessageParam;
 
@@ -177,10 +177,10 @@ test("mmagent.compact calls LLM once without tools and keeps last 10 turns", asy
           async create(body) {
             callCount += 1;
             toolsSent = body.tools;
-            return {
-              choices: [{ message: { content: "SUM" } }],
+            return llmChunks({
+              content: "SUM",
               usage: { prompt_tokens: 9, completion_tokens: 2, total_tokens: 11 },
-            };
+            });
           },
         },
       },

@@ -2,7 +2,7 @@ import { mkdtemp } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import type OpenAI from "openai";
-import { mmagent, type LlmClient, type TokenUsage } from "../src/agent.js";
+import { mmagent, type LlmChunk, type LlmClient, type TokenUsage } from "../src/agent.js";
 import { FileCheckpointStore, type CheckpointStore } from "../src/checkpoint.js";
 import type { Tool } from "../src/tools/types.js";
 import { RunBrowserJsTool } from "../src/tools/run-browser-js.js";
@@ -37,6 +37,25 @@ async function abortableDelay(ms: number, signal?: AbortSignal): Promise<void> {
   });
 }
 
+export function llmChunks(turn: ScriptTurn): AsyncIterable<LlmChunk> {
+  async function* chunks(): AsyncGenerator<LlmChunk> {
+    if ("tool_calls" in turn && turn.tool_calls) {
+      if (typeof turn.content === "string" && turn.content) yield { content: turn.content };
+      for (let index = 0; index < turn.tool_calls.length; index++) {
+        const tc = turn.tool_calls[index];
+        yield {
+          toolCallDeltas: [{ index, id: tc.id, name: tc.name, arguments: tc.arguments }],
+        };
+      }
+      if (turn.usage) yield { usage: turn.usage };
+      return;
+    }
+    const content = typeof turn.content === "string" ? turn.content : "";
+    yield { content, usage: turn.usage };
+  }
+  return chunks();
+}
+
 export function scriptedClient(turns: ScriptTurn[], delayMs = 0): LlmClient {
   let i = 0;
   return {
@@ -46,24 +65,7 @@ export function scriptedClient(turns: ScriptTurn[], delayMs = 0): LlmClient {
           await abortableDelay(delayMs, options?.signal);
           const turn = turns[i++];
           if (!turn) throw new Error("scripted LLM has no remaining turns");
-          if ("tool_calls" in turn && turn.tool_calls) {
-            return {
-              choices: [
-                {
-                  message: {
-                    content: turn.content ?? null,
-                    tool_calls: turn.tool_calls.map((tc) => ({
-                      id: tc.id,
-                      type: "function" as const,
-                      function: { name: tc.name, arguments: tc.arguments },
-                    })),
-                  },
-                },
-              ],
-              usage: turn.usage,
-            };
-          }
-          return { choices: [{ message: { content: turn.content } }], usage: turn.usage };
+          return llmChunks(turn);
         },
       },
     },
